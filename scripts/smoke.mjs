@@ -70,6 +70,9 @@ const child = spawn(process.execPath, [serviceEntry], {
         OPENCHAMBER_SERVICE_PORT: String(port),
         OPENCHAMBER_SERVICE_TOKEN: token,
         SQUEEZ_STATS_HOME: home,
+        // keep pricing hermetic: no real db, no network cache reuse
+        OPENCODE_DB_PATH: path.join(home, "does-not-exist.db"),
+        STATS_PRICING_CACHE: path.join(home, "no-cache.json"),
     },
     stdio: ["ignore", "pipe", "pipe"],
 })
@@ -126,6 +129,34 @@ try {
     assert.equal(body.daily[0].day, "2026-10-15")
     assert.equal(body.daily[0].events, 3)
     assert.equal(body.daily[0].savedTokens, 700)
+    assert.equal(body.scope.kind, "all")
+    assert.equal(body.scoped, null, "unscoped has no scoped aggregate")
+    assert.ok(Array.isArray(body.sessions) && body.sessions.length === 1)
+    assert.equal(body.sessions[0].stem, "2026-10-15-00")
+    assert.equal(body.sessions[0].savedTokens, 700)
+
+    // ---- scope: single session log
+    const sessStats = await fetch(`${base}/stats?session=2026-10-15-00`, { headers })
+    const sessBody = await sessStats.json()
+    assert.equal(sessBody.scope.kind, "session")
+    assert.equal(sessBody.scoped.events, 3)
+    assert.equal(sessBody.scoped.savedTokens, 700)
+    assert.equal(sessBody.allTime, null, "scoped view replaces allTime")
+    assert.ok(sessBody.scoped.handlers.some((h) => h.name === "git"), "bash cmd name aggregated")
+    assert.ok(sessBody.scoped.handlers.some((h) => h.name === "TodoWrite"), "tool name aggregated")
+
+    // ---- scope: day range covering the fixture day
+    const rangeStats = await fetch(`${base}/stats?from=2026-10-15&to=2026-10-15`, { headers })
+    const rangeBody = await rangeStats.json()
+    assert.equal(rangeBody.scope.kind, "range")
+    assert.equal(rangeBody.scoped.events, 2, "tool event is local Oct 14 21:35 - outside the Oct 15 day")
+    assert.equal(rangeBody.scoped.savedTokens, 700)
+
+    // ---- scope: range excluding everything
+    const emptyStats = await fetch(`${base}/stats?from=2020-01-01&to=2020-01-01`, { headers })
+    const emptyBody = await emptyStats.json()
+    assert.equal(emptyBody.scoped.events, 0)
+    assert.equal(emptyBody.daily.length, 0)
 
     // blobs
     assert.equal(body.blobs.count, 1)
@@ -134,7 +165,7 @@ try {
     const missing = await fetch(`${base}/nope`, { headers })
     assert.equal(missing.status, 404)
 
-    console.log("smoke ok: auth, /health, /stats, live+allTime+daily+blobs, malformed-line skip")
+    console.log("smoke ok: auth, /health, /stats, live+allTime+daily+blobs, scopes (all/session/range/empty), malformed-line skip")
 } finally {
     child.kill("SIGTERM")
     await fs.rm(home, { recursive: true, force: true })

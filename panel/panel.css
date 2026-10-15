@@ -388,3 +388,25 @@ html[data-oc-surface="panel"] body {
 .sq-status-error {
   color: var(--warning-text, var(--warning, currentColor));
 }
+
+/* ---------- scope picker ---------- */
+
+.sq-scope-select {
+  max-width: 100%;
+  border: 1px solid color-mix(in srgb, var(--interactive-border, var(--oc-border, currentColor)) 40%, transparent);
+  border-radius: var(--radius, 9px);
+  background: var(--surface-background, transparent);
+  color: var(--surface-foreground, inherit);
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+
+.sq-scope-select:focus-visible {
+  outline: 2px solid var(--primary, var(--oc-primary, #6b9fff));
+  outline-offset: 1px;
+}
