@@ -70,9 +70,11 @@ squeez keeps this under its home, `~/.claude/squeez`:
 - **`tokens_saved` in session records** re-counts the whole hourly log at the
   end of each session, so sessions that share an hour count each other's work
   (summed, it reports more than 8× what the events show). The panel recounts from events.
+  Reported upstream: [squeez#284](https://github.com/claudioemmanuel/squeez/issues/284).
 - **`handler_stats.json`** stops adding names once it holds 64, and it keys on
   the first word (`cd`, `export`, `"C:/Program`). Once full it silently misses
   most commands, so it is shown only as a storage fact, never as a total.
+  Reported upstream: [squeez#285](https://github.com/claudioemmanuel/squeez/issues/285).
 - **Merged log lines**: concurrent writers sometimes put two events on one line
   (`}{`). The panel splits and recovers them, and reports how many.
 - **Dollar figures** were removed: a saved token's value depends on the model
