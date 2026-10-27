@@ -1,294 +1,415 @@
 // service/main.ts
 import http from "node:http";
 
-// service/stats.ts
-import * as fs2 from "node:fs/promises";
-import * as os2 from "node:os";
-import * as path2 from "node:path";
+// service/report.ts
+var PRELUDE = new Set([
+  "cd",
+  "pushd",
+  "popd",
+  "export",
+  "set",
+  "unset",
+  "source",
+  ".",
+  "shopt",
+  "trap",
+  "true",
+  ":",
+  "local",
+  "declare",
+  "for",
+  "while",
+  "until",
+  "if",
+  "case",
+  "do",
+  "then",
+  "else",
+  "elif",
+  "done",
+  "fi",
+  "esac",
+  "[",
+  "[[",
+  "exit"
+]);
+var WRAPPERS = new Set(["sudo", "env", "nohup", "time", "command", "exec", "nice", "stdbuf", "&"]);
+var BODY_KEYWORD = /^\s*(?:do|then|else|elif)\s+/;
+var SUBSTITUTION = /^\s*(?:[A-Za-z_]\w*=\S*\s+)*[A-Za-z_]\w*=(?:\$\(|`)\s*([\s\S]*)$/;
+function tokenize(segment) {
+  return segment.match(/(?:[^\s"']+|"[^"]*"?|'[^']*'?)+/g) ?? [];
+}
+function bare(word) {
+  const unquoted = word.replace(/^["']|["']$/g, "");
+  const base = unquoted.split(/[\\/]/).pop() ?? unquoted;
+  return base.replace(/\.(exe|cmd|bat)$/i, "").toLowerCase();
+}
+function programOf(segment) {
+  const body = segment.replace(BODY_KEYWORD, "");
+  const sub = SUBSTITUTION.exec(body);
+  if (sub)
+    return programOf(sub[1] ?? "");
+  const tokens = tokenize(body.trim().replace(/^[({]+\s*/, ""));
+  let i = 0;
+  while (i < tokens.length) {
+    const t = tokens[i] ?? "";
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
+      i++;
+      continue;
+    }
+    if (WRAPPERS.has(bare(t))) {
+      i++;
+      while (i < tokens.length && /^(-\S*|\d+)$/.test(tokens[i] ?? ""))
+        i++;
+      continue;
+    }
+    if (bare(t) === "timeout") {
+      i++;
+      while (i < tokens.length && /^(-\S+|\d+[smhd]?)$/.test(tokens[i] ?? ""))
+        i++;
+      continue;
+    }
+    break;
+  }
+  const raw = tokens[i];
+  return raw ? bare(raw) : "";
+}
+function commandName(cmd) {
+  const segments = cmd.split(/\r?\n|&&|\|\||;|\|/);
+  let fallback = "";
+  for (const segment of segments) {
+    const name = programOf(segment);
+    if (!name)
+      continue;
+    if (!fallback)
+      fallback = name;
+    if (PRELUDE.has(name))
+      continue;
+    if (name === "echo" && segments.length > 1)
+      continue;
+    return name;
+  }
+  return fallback || "(empty)";
+}
+function toolLabel(tool) {
+  const m = /^mcp__([^_]+(?:_[^_]+)*?)__(.+)$/.exec(tool);
+  if (m)
+    return { name: m[2] ?? tool, server: m[1] ?? "" };
+  return { name: tool, server: "" };
+}
+function lowerBound(events, ts) {
+  let lo = 0;
+  let hi = events.length;
+  while (lo < hi) {
+    const mid = lo + hi >> 1;
+    if ((events[mid]?.ts ?? 0) < ts)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  return lo;
+}
+function slice(events, start, end) {
+  return events.slice(lowerBound(events, start), lowerBound(events, end));
+}
+function localDayStart(ms) {
+  const d = new Date(ms);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+function nextLocalDay(ms) {
+  const d = new Date(ms);
+  d.setDate(d.getDate() + 1);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+function localHourStart(ms) {
+  const d = new Date(ms);
+  d.setMinutes(0, 0, 0);
+  return d.getTime();
+}
+function pad(n) {
+  return String(n).padStart(2, "0");
+}
+function dayLabel(ms) {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+function hourLabel(ms) {
+  return `${pad(new Date(ms).getHours())}:00`;
+}
+var MAX_DAY_BUCKETS = 400;
+var HOUR_SPAN_LIMIT = 48 * 3600000;
+function emptyTotals() {
+  return { commands: 0, inTokens: 0, outTokens: 0, savedTokens: 0, compressed: 0, unchanged: 0, grew: 0 };
+}
+function addShell(totals, e) {
+  totals.commands++;
+  totals.inTokens += e.inTk;
+  totals.outTokens += e.outTk;
+  if (e.inTk > e.outTk) {
+    totals.savedTokens += e.inTk - e.outTk;
+    totals.compressed++;
+  } else if (e.inTk === e.outTk)
+    totals.unchanged++;
+  else
+    totals.grew++;
+}
+function bump(map, text, ts) {
+  const key = text.trim().replace(/\s+/g, " ").slice(0, 200);
+  if (!key)
+    return;
+  const row = map.get(key);
+  if (row) {
+    row.count++;
+    if (ts > row.last)
+      row.last = ts;
+  } else
+    map.set(key, { text: key, count: 1, last: ts });
+}
+function buildWindowReport(allEvents, sessionStarts, start, end) {
+  const events = slice(allEvents, start, end);
+  const firstEvent = events[0]?.ts ?? null;
+  const lastEvent = events[events.length - 1]?.ts ?? null;
+  const shell = emptyTotals();
+  const tools = { calls: 0, tokens: 0 };
+  const commands = new Map;
+  const toolMap = new Map;
+  const errors = new Map;
+  const files = new Map;
+  const git = new Map;
+  const tests = [];
+  const largest = [];
+  const hourOfDay = Array.from({ length: 24 }, (_, hour) => ({ hour, commands: 0, toolCalls: 0 }));
+  const stop = Math.min(end, Date.now());
+  const from = start > 0 ? start : firstEvent ?? stop;
+  const granularity = stop - from <= HOUR_SPAN_LIMIT ? "hour" : "day";
+  const series = [];
+  if (firstEvent !== null) {
+    let cursor = granularity === "hour" ? localHourStart(from) : localDayStart(Math.max(from, firstEvent));
+    while (cursor < stop && series.length < (granularity === "hour" ? 49 : MAX_DAY_BUCKETS)) {
+      series.push({
+        start: cursor,
+        label: granularity === "hour" ? hourLabel(cursor) : dayLabel(cursor),
+        commands: 0,
+        savedTokens: 0,
+        inTokens: 0,
+        outTokens: 0,
+        toolCalls: 0,
+        toolTokens: 0
+      });
+      cursor = granularity === "hour" ? cursor + 3600000 : nextLocalDay(cursor);
+    }
+  }
+  let bucket = 0;
+  const pointFor = (ts) => {
+    while (bucket + 1 < series.length && (series[bucket + 1]?.start ?? Infinity) <= ts)
+      bucket++;
+    const p = series[bucket];
+    return p && p.start <= ts ? p : null;
+  };
+  for (const e of events) {
+    if (e.kind === "bash") {
+      addShell(shell, e);
+      const name = commandName(e.cmd);
+      const row = commands.get(name) ?? { name, runs: 0, inTokens: 0, outTokens: 0, savedTokens: 0, compressedRuns: 0 };
+      row.runs++;
+      row.inTokens += e.inTk;
+      row.outTokens += e.outTk;
+      if (e.inTk > e.outTk) {
+        row.savedTokens += e.inTk - e.outTk;
+        row.compressedRuns++;
+      }
+      commands.set(name, row);
+      for (const err of e.errors)
+        bump(errors, err, e.ts);
+      for (const f of e.files)
+        bump(files, f, e.ts);
+      for (const g of e.git)
+        bump(git, g, e.ts);
+      if (e.test.trim())
+        tests.push({ text: e.test.trim().slice(0, 200), ts: e.ts });
+      if (e.inTk > 0) {
+        largest.push({ cmd: e.cmd.slice(0, 240), inTokens: e.inTk, outTokens: e.outTk, ts: e.ts });
+        if (largest.length > 40) {
+          largest.sort((a, b) => b.inTokens - a.inTokens);
+          largest.length = 10;
+        }
+      }
+      hourOfDay[new Date(e.ts).getHours()].commands++;
+      const p = pointFor(e.ts);
+      if (p) {
+        p.commands++;
+        p.inTokens += e.inTk;
+        p.outTokens += e.outTk;
+        if (e.inTk > e.outTk)
+          p.savedTokens += e.inTk - e.outTk;
+      }
+    } else if (e.kind === "tool") {
+      tools.calls++;
+      tools.tokens += e.tokens;
+      addTool(toolMap, e);
+      hourOfDay[new Date(e.ts).getHours()].toolCalls++;
+      const p = pointFor(e.ts);
+      if (p) {
+        p.toolCalls++;
+        p.toolTokens += e.tokens;
+      }
+    }
+  }
+  const rows = [...commands.values()];
+  largest.sort((a, b) => b.inTokens - a.inTokens);
+  return {
+    start,
+    end,
+    firstEvent,
+    lastEvent,
+    shell,
+    tools,
+    sessionsStarted: sessionStarts.filter((s) => s >= start && s < end).length,
+    granularity,
+    series,
+    hourOfDay,
+    topCommands: rows.filter((r) => r.savedTokens > 0).sort((a, b) => b.savedTokens - a.savedTokens).slice(0, 12),
+    weakCommands: rows.filter((r) => r.outTokens > 0 && r.savedTokens < r.inTokens * 0.1).sort((a, b) => b.outTokens - a.outTokens).slice(0, 8),
+    largestOutputs: largest.slice(0, 6),
+    toolsByName: [...toolMap.values()].sort((a, b) => b.tokens - a.tokens).slice(0, 12),
+    errors: topCounts(errors, 8),
+    files: topCounts(files, 10),
+    git: [...git.values()].sort((a, b) => b.last - a.last).slice(0, 10),
+    tests: tests.slice(-8).reverse()
+  };
+}
+function addTool(map, e) {
+  const row = map.get(e.tool);
+  if (row) {
+    row.calls++;
+    row.tokens += e.tokens;
+  } else {
+    const { name, server } = toolLabel(e.tool);
+    map.set(e.tool, { name, server, calls: 1, tokens: e.tokens });
+  }
+}
+function topCounts(map, n) {
+  return [...map.values()].sort((a, b) => b.count - a.count || b.last - a.last).slice(0, n);
+}
+function sessionStarts(summaries, current) {
+  const set = new Set;
+  for (const s of summaries)
+    set.add(s.start);
+  if (current)
+    set.add(current.start);
+  return [...set].sort((a, b) => a - b);
+}
+var MAX_SESSION_ROWS = 300;
+function buildSessions(allEvents, summaries, current, start, end, now) {
+  const starts = sessionStarts(summaries, current);
+  const byStart = new Map;
+  for (const s of summaries)
+    byStart.set(s.start, s);
+  const rows = [];
+  let active = 0;
+  let empty = 0;
+  for (let i = 0;i < starts.length; i++) {
+    const s = starts[i] ?? 0;
+    if (s < start || s >= end)
+      continue;
+    const row = sessionRow(allEvents, starts, i, byStart, current, now);
+    if (row.shellCommands + row.toolCalls > 0)
+      active++;
+    else
+      empty++;
+    rows.push(row);
+  }
+  rows.reverse();
+  const total = rows.length;
+  return { total, active, empty, rows: rows.slice(0, MAX_SESSION_ROWS), truncated: total > MAX_SESSION_ROWS };
+}
+function sessionRow(allEvents, starts, i, byStart, current, now) {
+  const s = starts[i] ?? 0;
+  const next = starts[i + 1];
+  const ongoing = next === undefined && current !== null && current.start === s;
+  const end = next ?? (ongoing ? now : s + (byStart.get(s)?.durationMin ?? 0) * 60000);
+  const totals = emptyTotals();
+  let toolCalls = 0;
+  let toolTokens = 0;
+  for (const e of slice(allEvents, s, Math.max(end, s + 1))) {
+    if (e.kind === "bash")
+      addShell(totals, e);
+    else if (e.kind === "tool") {
+      toolCalls++;
+      toolTokens += e.tokens;
+    }
+  }
+  const summary = byStart.get(s);
+  return {
+    start: s,
+    end,
+    ongoing,
+    shellCommands: totals.commands,
+    inTokens: totals.inTokens,
+    outTokens: totals.outTokens,
+    savedTokens: totals.savedTokens,
+    toolCalls,
+    toolTokens,
+    summary: summary ? {
+      filesTouched: summary.filesTouchedCount,
+      errors: summary.errors.length,
+      gitEvents: summary.gitEvents.length,
+      scoreOverall: summary.score.overall
+    } : null
+  };
+}
+function buildSessionDetail(allEvents, summaries, current, sessionStart, now) {
+  const starts = sessionStarts(summaries, current);
+  const i = starts.indexOf(sessionStart);
+  if (i < 0)
+    return { row: null, summary: null, report: null };
+  const byStart = new Map;
+  for (const s of summaries)
+    byStart.set(s.start, s);
+  const row = sessionRow(allEvents, starts, i, byStart, current, now);
+  return {
+    row,
+    summary: byStart.get(sessionStart) ?? null,
+    report: buildWindowReport(allEvents, starts, row.start, Math.max(row.end, row.start + 1))
+  };
+}
+function handlerSummary(rows, max) {
+  let calls = 0;
+  let inTokens = 0;
+  let outTokens = 0;
+  for (const r of rows) {
+    calls += r.calls;
+    inTokens += r.inTokens;
+    outTokens += r.outTokens;
+  }
+  return {
+    used: rows.length,
+    max,
+    rows: [...rows].sort((a, b) => b.inTokens - b.outTokens - (a.inTokens - a.outTokens)).slice(0, 12),
+    calls,
+    inTokens,
+    outTokens
+  };
+}
+function trimContext(ctx) {
+  if (!ctx)
+    return null;
+  return {
+    ...ctx,
+    recentCalls: ctx.recentCalls.slice(0, 12),
+    repeatedErrors: ctx.repeatedErrors.slice(0, 8),
+    fileEdits: ctx.fileEdits.slice(0, 10),
+    repeatedCommands: ctx.repeatedCommands.slice(0, 8)
+  };
+}
 
-// service/pricing.ts
+// service/store.ts
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { DatabaseSync } from "node:sqlite";
-var MODELS_DEV_URL = "https://models.dev/api.json";
-var RATES_TTL_MS = 24 * 3600000;
-var MIX_TTL_MS = 5 * 60000;
-var DROP_TOKENS = new Set([
-  "latest",
-  "preview",
-  "thinking",
-  "instruct",
-  "chat",
-  "the"
-]);
-function tokenize(text) {
-  return new Set(text.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 2 && !DROP_TOKENS.has(t)));
-}
-function scoreOverlap(a, b) {
-  let score = 0;
-  for (const t of a)
-    if (b.has(t))
-      score += t.length > 3 ? 2 : 1;
-  return score;
-}
-function parseModelRef(raw) {
-  if (typeof raw !== "string" || !raw.trim())
-    return null;
-  const text = raw.trim();
-  if (text.startsWith("{")) {
-    try {
-      const parsed = JSON.parse(text);
-      if (typeof parsed === "object" && parsed !== null) {
-        const o = parsed;
-        if (typeof o.id === "string" && o.id) {
-          return { provider: typeof o.providerID === "string" ? o.providerID : "", model: o.id };
-        }
-      }
-    } catch {}
-    return null;
-  }
-  const slash = text.indexOf("/");
-  return slash > 0 ? { provider: text.slice(0, slash), model: text.slice(slash + 1) } : { provider: "", model: text };
-}
-function versionRuns(text) {
-  return text.match(/\d+/g) ?? [];
-}
-
-class PricingEngine {
-  cacheFile;
-  dbPaths;
-  rates = null;
-  ratesLoadedAt = 0;
-  mixCache = new Map;
-  constructor(opts) {
-    const home = os.homedir();
-    this.cacheFile = opts?.cacheFile ?? process.env.STATS_PRICING_CACHE ?? path.join(home, ".config", "openchamber", "squeez-stats-pricing.json");
-    const xdgData = process.env.XDG_DATA_HOME;
-    this.dbPaths = opts?.dbPaths ?? [
-      ...process.env.OPENCODE_DB_PATH ? [process.env.OPENCODE_DB_PATH] : [],
-      ...xdgData && xdgData.trim() ? [path.join(xdgData.trim(), "opencode", "opencode.db")] : [],
-      path.join(home, ".local", "share", "opencode", "opencode.db"),
-      path.join(home, ".opencode-v2", "data", "opencode.db")
-    ];
-  }
-  async price(windowStart, windowEnd, tokensSaved) {
-    try {
-      if (!(tokensSaved > 0))
-        return null;
-      const mix = await this.getMix(windowStart, windowEnd);
-      if (mix.length === 0)
-        return null;
-      await this.loadRates();
-      const priced = this.applyRates(mix);
-      const totalWeight = priced.reduce((s, m) => s + m.weight, 0);
-      if (totalWeight <= 0)
-        return null;
-      let weightedInput = 0;
-      let weightedCache = 0;
-      let coveredWeight = 0;
-      for (const m of priced) {
-        if (m.inputRate === null)
-          continue;
-        coveredWeight += m.weight;
-        weightedInput += m.share * m.inputRate;
-        weightedCache += m.share * (m.cacheRate ?? m.inputRate);
-      }
-      if (coveredWeight <= 0)
-        return null;
-      const coverage = coveredWeight / totalWeight;
-      const scale = 1 / coverage;
-      return {
-        dollarsMin: tokensSaved / 1e6 * weightedCache * scale,
-        dollarsMax: tokensSaved / 1e6 * weightedInput * scale,
-        coverage,
-        mix: priced,
-        windowStart,
-        windowEnd
-      };
-    } catch {
-      return null;
-    }
-  }
-  async getMix(windowStart, windowEnd) {
-    const cacheKey = `${Math.floor(windowStart / 60000)}:${Math.floor(windowEnd / 60000)}`;
-    const cached = this.mixCache.get(cacheKey);
-    if (cached && Date.now() - cached.at < MIX_TTL_MS)
-      return cached.mix;
-    const dbPath = await this.freshestDb();
-    if (!dbPath)
-      return [];
-    const mix = this.queryMix(dbPath, windowStart, windowEnd);
-    this.mixCache.set(cacheKey, { at: Date.now(), mix });
-    return mix;
-  }
-  async freshestDb() {
-    let best = null;
-    let bestMtime = -1;
-    for (const p of this.dbPaths) {
-      try {
-        const stat2 = await fs.stat(p);
-        if (stat2.isFile() && stat2.mtimeMs > bestMtime) {
-          bestMtime = stat2.mtimeMs;
-          best = p;
-        }
-      } catch {}
-    }
-    return best;
-  }
-  queryMix(dbPath, startMs, endMs) {
-    let db = null;
-    try {
-      db = new DatabaseSync(dbPath, { readOnly: true });
-      const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('session_v2','session')").all().map((r) => r.name).filter((n) => typeof n === "string");
-      const byKey = new Map;
-      const seenIds = new Set;
-      for (const table of ["session_v2", "session"]) {
-        if (!tables.includes(table))
-          continue;
-        const rows = db.prepare(`SELECT id, model, tokens_input, tokens_cache_read
-                         FROM ${table}
-                         WHERE time_created <= ? AND time_updated >= ?`).all(endMs, startMs);
-        for (const row of rows) {
-          if (typeof row.id === "string") {
-            if (seenIds.has(row.id))
-              continue;
-            seenIds.add(row.id);
-          }
-          const weight = (typeof row.tokens_input === "number" ? row.tokens_input : 0) + (typeof row.tokens_cache_read === "number" ? row.tokens_cache_read : 0);
-          if (!(weight > 0))
-            continue;
-          const ref = parseModelRef(row.model);
-          if (!ref)
-            continue;
-          const key = ref.provider ? `${ref.provider}/${ref.model}` : ref.model;
-          const existing = byKey.get(key);
-          if (existing) {
-            existing.weight += weight;
-          } else {
-            byKey.set(key, {
-              key,
-              provider: ref.provider,
-              model: ref.model,
-              weight,
-              share: 0,
-              inputRate: null,
-              cacheRate: null,
-              matched: null
-            });
-          }
-        }
-      }
-      const entries = [...byKey.values()];
-      const total = entries.reduce((sum, e) => sum + e.weight, 0);
-      for (const e of entries)
-        e.share = total > 0 ? e.weight / total : 0;
-      entries.sort((a, b) => b.weight - a.weight);
-      return entries;
-    } catch {
-      return [];
-    } finally {
-      try {
-        db?.close();
-      } catch {}
-    }
-  }
-  async loadRates() {
-    if (this.rates && Date.now() - this.ratesLoadedAt < RATES_TTL_MS)
-      return;
-    try {
-      const stat2 = await fs.stat(this.cacheFile);
-      if (Date.now() - stat2.mtimeMs < RATES_TTL_MS) {
-        const raw2 = JSON.parse(await fs.readFile(this.cacheFile, "utf8"));
-        const parsed2 = this.parseRates(raw2);
-        if (parsed2.length > 0) {
-          this.rates = parsed2;
-          this.ratesLoadedAt = Date.now();
-          return;
-        }
-      }
-    } catch {}
-    const res = await fetch(MODELS_DEV_URL, { signal: AbortSignal.timeout(20000) });
-    if (!res.ok)
-      throw new Error(`models.dev HTTP ${res.status}`);
-    const raw = await res.json();
-    const parsed = this.parseRates(raw);
-    if (parsed.length === 0)
-      throw new Error("models.dev payload had no priced models");
-    this.rates = parsed;
-    this.ratesLoadedAt = Date.now();
-    try {
-      await fs.mkdir(path.dirname(this.cacheFile), { recursive: true });
-      const tmp = `${this.cacheFile}.tmp`;
-      await fs.writeFile(tmp, JSON.stringify(raw));
-      await fs.rename(tmp, this.cacheFile);
-    } catch {}
-  }
-  parseRates(raw) {
-    if (typeof raw !== "object" || raw === null)
-      return [];
-    const out = [];
-    for (const [providerId, provider] of Object.entries(raw)) {
-      if (typeof provider !== "object" || provider === null)
-        continue;
-      const models = provider.models;
-      if (typeof models !== "object" || models === null)
-        continue;
-      for (const [modelId, model] of Object.entries(models)) {
-        if (typeof model !== "object" || model === null)
-          continue;
-        const m = model;
-        const cost = m.cost;
-        const inputRate = typeof cost?.input === "number" ? cost.input : null;
-        if (inputRate === null || !(inputRate > 0))
-          continue;
-        const cacheRate = typeof cost?.cache_read === "number" && cost.cache_read > 0 ? cost.cache_read : null;
-        out.push({
-          id: `${providerId}/${modelId}`,
-          tokens: tokenize(`${providerId} ${modelId} ${typeof m.name === "string" ? m.name : ""}`),
-          inputRate,
-          cacheRate
-        });
-      }
-    }
-    return out;
-  }
-  applyRates(mix) {
-    if (!this.rates)
-      return mix;
-    for (const entry of mix) {
-      const want = tokenize(`${entry.model} ${entry.provider}`);
-      const wantVersions = versionRuns(entry.model);
-      let best = null;
-      let bestScore = 0;
-      for (const rate of this.rates) {
-        let score = scoreOverlap(want, rate.tokens);
-        const rateVersions = versionRuns(rate.id);
-        if (wantVersions.length > 0 && rateVersions.length > 0) {
-          if (wantVersions[0] === rateVersions[0]) {
-            score += 2;
-            if (wantVersions.length > 1 && wantVersions[1] === rateVersions[1])
-              score += 1;
-          } else {
-            score -= 3;
-          }
-        }
-        if (score > bestScore) {
-          bestScore = score;
-          best = rate;
-        }
-      }
-      if (best && bestScore >= 2) {
-        entry.inputRate = best.inputRate;
-        entry.cacheRate = best.cacheRate;
-        entry.matched = best.id;
-      }
-    }
-    return mix;
-  }
-}
-
-// service/stats.ts
+var HANDLER_TABLE_MAX = 64;
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -298,359 +419,453 @@ function num(value) {
 function str(value) {
   return typeof value === "string" ? value : "";
 }
+function strArray(value, cap = Infinity) {
+  if (!Array.isArray(value))
+    return [];
+  const out = [];
+  for (const item of value) {
+    if (typeof item === "string" && item.trim())
+      out.push(item);
+    if (out.length >= cap)
+      break;
+  }
+  return out;
+}
+function numArray(value) {
+  return Array.isArray(value) ? value.map(num) : [];
+}
+function splitObjects(line) {
+  const out = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0;i < line.length; i++) {
+    const c = line[i];
+    if (inString) {
+      if (escaped)
+        escaped = false;
+      else if (c === "\\")
+        escaped = true;
+      else if (c === '"')
+        inString = false;
+      continue;
+    }
+    if (c === '"')
+      inString = true;
+    else if (c === "{") {
+      if (depth === 0)
+        start = i;
+      depth++;
+    } else if (c === "}" && depth > 0) {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        out.push(line.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+  return out;
+}
+function toEvent(raw) {
+  if (!isRecord(raw))
+    return null;
+  const ts = num(raw.ts) * 1000;
+  if (ts <= 0)
+    return null;
+  switch (str(raw.type)) {
+    case "bash":
+      return {
+        kind: "bash",
+        ts,
+        cmd: str(raw.cmd),
+        inTk: Math.max(0, num(raw.in_tk)),
+        outTk: Math.max(0, num(raw.out_tk)),
+        files: strArray(raw.files, 50),
+        errors: strArray(raw.errors, 20),
+        git: strArray(raw.git, 20),
+        test: str(raw.test_summary)
+      };
+    case "tool":
+      return { kind: "tool", ts, tool: str(raw.tool) || "unknown", tokens: Math.max(0, num(raw.tokens_est)) };
+    case "git_snapshot":
+      return { kind: "git", ts };
+    default:
+      return null;
+  }
+}
+function parseLog(text) {
+  const events = [];
+  let recovered = 0;
+  let unreadable = 0;
+  for (const line of text.split(`
+`)) {
+    const trimmed = line.trim();
+    if (!trimmed)
+      continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      const parts = splitObjects(trimmed);
+      let any = false;
+      for (const part of parts) {
+        try {
+          const event2 = toEvent(JSON.parse(part));
+          if (event2) {
+            events.push(event2);
+            recovered++;
+            any = true;
+          }
+        } catch {}
+      }
+      if (!any)
+        unreadable++;
+      continue;
+    }
+    const event = toEvent(parsed);
+    if (event)
+      events.push(event);
+  }
+  return { events, recovered, unreadable };
+}
+function bp(value) {
+  return Math.min(1e4, Math.max(0, num(value)));
+}
+function toSummary(raw) {
+  if (!isRecord(raw))
+    return null;
+  const startSec = num(raw.valid_from) || num(raw.ts);
+  if (startSec <= 0)
+    return null;
+  const filesTouched = Array.isArray(raw.files_touched) ? raw.files_touched : [];
+  const filesCommitted = Array.isArray(raw.files_committed) ? raw.files_committed : [];
+  return {
+    start: startSec * 1000,
+    durationMin: num(raw.duration_min),
+    filesTouched: strArray(filesTouched, 30),
+    filesTouchedCount: filesTouched.length,
+    filesCommittedCount: filesCommitted.length,
+    errors: strArray(raw.errors_resolved, 10),
+    gitEvents: strArray(raw.git_events, 10),
+    testSummary: str(raw.test_summary),
+    completed: strArray(raw.completed, 5),
+    nextSteps: strArray(raw.next_steps, 5),
+    score: {
+      overall: bp(raw.efficiency_overall_bp),
+      compression: bp(raw.compression_ratio_bp),
+      toolChoice: bp(raw.tool_choice_efficiency_bp),
+      reuse: bp(raw.context_reuse_rate_bp),
+      budget: bp(raw.budget_utilization_bp)
+    }
+  };
+}
+function toCurrent(raw) {
+  if (!isRecord(raw))
+    return null;
+  const start = num(raw.start_ts) * 1000;
+  if (start <= 0)
+    return null;
+  return {
+    sessionFile: str(raw.session_file),
+    start,
+    receivedTokens: num(raw.total_tokens),
+    savedTokens: num(raw.tokens_saved),
+    trackedCalls: num(raw.total_calls),
+    overheadTokens: num(raw.overhead_tokens)
+  };
+}
+function zip(a, b) {
+  const n = Math.min(a.length, b.length);
+  const out = [];
+  for (let i = 0;i < n; i++)
+    out.push([a[i], b[i]]);
+  return out;
+}
+function toContext(raw) {
+  if (!isRecord(raw))
+    return null;
+  const callN = numArray(raw.call_log_n);
+  const callCmd = strArrayKeepEmpty(raw.call_log_cmd);
+  const callLen = numArray(raw.call_log_len);
+  const recentCalls = zip(zip(callN, callCmd), callLen).map(([[n, label], bytes]) => ({ n, label, bytes })).reverse();
+  const snippetText = new Map;
+  for (const [fp, text] of zip(numArray(raw.error_snippet_fp), strArrayKeepEmpty(raw.error_snippet_text))) {
+    if (text)
+      snippetText.set(fp, text);
+  }
+  const repeatedErrors = zip(numArray(raw.error_count_fp), numArray(raw.error_count_n)).map(([fp, count]) => ({ text: snippetText.get(fp) ?? "", count })).filter((e) => e.text && e.count > 0).sort((a, b) => b.count - a.count);
+  const fileEdits = zip(strArrayKeepEmpty(raw.file_mod_path), numArray(raw.file_mod_n)).map(([p, count]) => ({ path: p, count })).filter((f) => f.path && f.count > 0).sort((a, b) => b.count - a.count);
+  const repeatedCommands = zip(strArrayKeepEmpty(raw.cmd_repeat_name), numArray(raw.cmd_repeat_n)).map(([name, count]) => ({ name, count })).filter((c) => c.name && c.count > 0).sort((a, b) => b.count - a.count);
+  return {
+    sessionFile: str(raw.session_file),
+    callCounter: num(raw.call_counter),
+    tokensBash: num(raw.tokens_bash),
+    tokensRead: num(raw.tokens_read),
+    tokensGrep: num(raw.tokens_grep),
+    tokensOther: num(raw.tokens_other),
+    rereads: num(raw.reread_count),
+    exactDedupHits: num(raw.exact_dedup_hits),
+    fuzzyDedupHits: num(raw.fuzzy_dedup_hits),
+    summarizeTriggers: num(raw.summarize_triggers),
+    ultraCalls: num(raw.intensity_ultra_calls),
+    agentSpawns: num(raw.agent_spawns),
+    agentEstimatedTokens: num(raw.agent_estimated_tokens),
+    agentMeasuredTokens: num(raw.agent_measured_tokens),
+    agentMeasuredCount: num(raw.agent_measured_count),
+    ctxTokens: num(raw.real_ctx_tokens),
+    ctxWindow: num(raw.real_ctx_window),
+    cacheReadTokens: num(raw.real_cache_read_tokens),
+    callsThisMinute: num(raw.calls_this_minute),
+    lastActivity: num(raw.last_activity_ts) * 1000,
+    recentCalls,
+    seenFiles: Array.isArray(raw.seen_files_path) ? raw.seen_files_path.length : 0,
+    repeatedErrors,
+    fileEdits,
+    repeatedCommands,
+    nudges: strArray(raw.nudged_keys, 20)
+  };
+}
+function strArrayKeepEmpty(value) {
+  return Array.isArray(value) ? value.map(str) : [];
+}
+function toHandlerRows(raw) {
+  if (!isRecord(raw))
+    return [];
+  const names = strArrayKeepEmpty(raw.names);
+  const calls = numArray(raw.calls);
+  const inTk = numArray(raw.in_tokens);
+  const outTk = numArray(raw.out_tokens);
+  const n = Math.min(names.length, calls.length, inTk.length, outTk.length);
+  const rows = [];
+  for (let i = 0;i < n; i++) {
+    rows.push({ name: names[i] ?? "", calls: calls[i] ?? 0, inTokens: inTk[i] ?? 0, outTokens: outTk[i] ?? 0 });
+  }
+  return rows;
+}
+function parseIni(text) {
+  const out = {};
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith(";"))
+      continue;
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0)
+      continue;
+    out[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
+  }
+  return out;
+}
 function resolveSqueezHome() {
   const override = process.env.SQUEEZ_STATS_HOME;
   if (override && override.trim())
-    return override.trim();
-  return path2.join(os2.homedir(), ".claude", "squeez");
+    return path.resolve(override.trim());
+  return path.join(os.homedir(), ".claude", "squeez");
 }
-function bashCommandName(cmd) {
-  const first = cmd.trim().split(/\s+/)[0] ?? "";
-  const base = first.split(/[\\/]/).pop() ?? first;
-  return base.length > 24 ? `${base.slice(0, 24)}…` : base || "bash";
-}
-function parseEvent(line) {
-  let raw;
-  try {
-    raw = JSON.parse(line);
-  } catch {
-    return null;
-  }
-  if (!isRecord(raw))
-    return null;
-  const type = str(raw.type);
-  const ts = num(raw.ts) * 1000;
-  if (type === "bash") {
-    return {
-      kind: "bash",
-      name: bashCommandName(str(raw.cmd)),
-      inTokens: num(raw.in_tk),
-      outTokens: num(raw.out_tk),
-      ts
-    };
-  }
-  if (type === "tool") {
-    const est = num(raw.tokens_est);
-    return { kind: "tool", name: str(raw.tool) || "tool", inTokens: est, outTokens: est, ts };
-  }
-  return null;
-}
-var FILE_NAME_RE = /^(\d{4}-\d{2}-\d{2})-(\d{2})\.jsonl$/;
-function dayFromFileName(name) {
-  const match = FILE_NAME_RE.exec(name);
-  return match ? match[1] : null;
-}
-function hourFromFileName(name) {
-  const match = FILE_NAME_RE.exec(name);
-  if (!match)
-    return null;
-  const [y, m, d] = match[1].split("-").map(Number);
-  const ms = new Date(y, m - 1, d, Number(match[2])).getTime();
-  return Number.isFinite(ms) ? ms : null;
-}
-function dayStartMs(day) {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
-  if (!match)
-    return null;
-  const ms = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3])).getTime();
-  return Number.isFinite(ms) ? ms : null;
-}
-var MAX_SESSION_FILES = 400;
+var LOG_NAME = /^\d{4}-\d{2}-\d{2}-\d{2}\.jsonl$/;
 
-class StatsStore {
-  squeezHome;
-  pricing;
-  constructor(squeezHome, pricing) {
-    this.squeezHome = squeezHome;
-    this.pricing = pricing ?? new PricingEngine;
+class SqueezStore {
+  home;
+  sessionsDir;
+  logs = new Map;
+  mergedEvents = [];
+  mergedKey = "";
+  summaries = null;
+  blobs = null;
+  constructor(home) {
+    this.home = home;
+    this.sessionsDir = path.join(home, "sessions");
   }
-  get sessionsDir() {
-    return path2.join(this.squeezHome, "sessions");
+  async exists() {
+    try {
+      return (await fs.stat(this.sessionsDir)).isDirectory();
+    } catch {
+      return false;
+    }
+  }
+  async stat(file) {
+    try {
+      const st = await fs.stat(file);
+      return st.isFile() ? { mtimeMs: st.mtimeMs, size: st.size } : null;
+    } catch {
+      return null;
+    }
   }
   async readJson(file) {
     try {
-      return JSON.parse(await fs2.readFile(file, "utf8"));
+      return JSON.parse(await fs.readFile(file, "utf8"));
     } catch {
       return null;
     }
   }
-  async readHandlers() {
-    const raw = await this.readJson(path2.join(this.sessionsDir, "handler_stats.json"));
-    if (!isRecord(raw))
-      return [];
-    const names = Array.isArray(raw.names) ? raw.names : [];
-    const calls = Array.isArray(raw.calls) ? raw.calls : [];
-    const inTokens = Array.isArray(raw.in_tokens) ? raw.in_tokens : [];
-    const outTokens = Array.isArray(raw.out_tokens) ? raw.out_tokens : [];
-    const handlers = [];
-    for (let i = 0;i < names.length; i++) {
-      const name = names[i];
-      if (typeof name !== "string" || !name)
-        continue;
-      const inT = num(inTokens[i]);
-      const outT = num(outTokens[i]);
-      handlers.push({
-        name,
-        calls: num(calls[i]),
-        inTokens: inT,
-        outTokens: outT,
-        savedTokens: Math.max(0, inT - outT)
-      });
-    }
-    handlers.sort((a, b) => b.savedTokens - a.savedTokens);
-    return handlers;
-  }
-  async readSessionEvents(file) {
-    let text;
+  async events() {
+    let names;
     try {
-      text = await fs2.readFile(path2.join(this.sessionsDir, file), "utf8");
+      names = (await fs.readdir(this.sessionsDir)).filter((n) => LOG_NAME.test(n)).sort();
     } catch {
-      return [];
+      names = [];
     }
-    const events = [];
-    for (const line of text.split(`
-`)) {
-      if (!line.trim())
+    const keyParts = [];
+    const live = new Set(names);
+    for (const name of names) {
+      const file = path.join(this.sessionsDir, name);
+      const stamp = await this.stat(file);
+      if (!stamp)
         continue;
-      const event = parseEvent(line);
-      if (event)
-        events.push(event);
+      const cached = this.logs.get(name);
+      if (!cached || cached.mtimeMs !== stamp.mtimeMs || cached.size !== stamp.size) {
+        let text = "";
+        try {
+          text = await fs.readFile(file, "utf8");
+        } catch {
+          continue;
+        }
+        this.logs.set(name, { ...stamp, ...parseLog(text) });
+      }
+      keyParts.push(`${name}:${stamp.mtimeMs}:${stamp.size}`);
     }
-    return events;
+    for (const name of [...this.logs.keys()])
+      if (!live.has(name))
+        this.logs.delete(name);
+    const key = keyParts.join("|");
+    if (key !== this.mergedKey) {
+      const all = [];
+      for (const log of this.logs.values())
+        for (const e of log.events)
+          all.push(e);
+      all.sort((a, b) => a.ts - b.ts);
+      this.mergedEvents = all;
+      this.mergedKey = key;
+    }
+    return this.mergedEvents;
   }
-  async readBlobs() {
-    const blobsDir = path2.join(this.squeezHome, "blobs");
-    let entries;
-    try {
-      entries = await fs2.readdir(blobsDir, { withFileTypes: true });
-    } catch {
-      return null;
-    }
-    let count = 0;
+  async logInfo() {
+    const events = await this.events();
     let bytes = 0;
-    for (const entry of entries) {
-      if (!entry.isFile())
-        continue;
+    let recovered = 0;
+    let unreadable = 0;
+    for (const log of this.logs.values()) {
+      bytes += log.size;
+      recovered += log.recovered;
+      unreadable += log.unreadable;
+    }
+    return {
+      files: this.logs.size,
+      bytes,
+      events: events.length,
+      recoveredEvents: recovered,
+      unreadableLines: unreadable,
+      firstEvent: events[0]?.ts ?? null,
+      lastEvent: events[events.length - 1]?.ts ?? null
+    };
+  }
+  async summaryRecords() {
+    const file = path.join(this.home, "memory", "summaries.jsonl");
+    const stamp = await this.stat(file);
+    if (!stamp) {
+      this.summaries = null;
+      return { records: [], info: { count: 0, bytes: 0, unreadableLines: 0, first: null, last: null } };
+    }
+    if (!this.summaries || this.summaries.stamp.mtimeMs !== stamp.mtimeMs || this.summaries.stamp.size !== stamp.size) {
+      let text = "";
       try {
-        const stat3 = await fs2.stat(path2.join(blobsDir, entry.name));
-        bytes += stat3.size;
-        count += 1;
+        text = await fs.readFile(file, "utf8");
+      } catch {
+        text = "";
+      }
+      const records2 = [];
+      let unreadable2 = 0;
+      for (const line of text.split(`
+`)) {
+        if (!line.trim())
+          continue;
+        try {
+          const record = toSummary(JSON.parse(line));
+          if (record)
+            records2.push(record);
+          else
+            unreadable2++;
+        } catch {
+          unreadable2++;
+        }
+      }
+      records2.sort((a, b) => a.start - b.start);
+      this.summaries = { stamp, records: records2, unreadable: unreadable2 };
+    }
+    const { records, unreadable } = this.summaries;
+    return {
+      records,
+      info: {
+        count: records.length,
+        bytes: stamp.size,
+        unreadableLines: unreadable,
+        first: records[0]?.start ?? null,
+        last: records[records.length - 1]?.start ?? null
+      }
+    };
+  }
+  async current() {
+    return toCurrent(await this.readJson(path.join(this.sessionsDir, "current.json")));
+  }
+  async context() {
+    return toContext(await this.readJson(path.join(this.sessionsDir, "context.json")));
+  }
+  async handlerRows() {
+    return toHandlerRows(await this.readJson(path.join(this.sessionsDir, "handler_stats.json")));
+  }
+  async config() {
+    try {
+      return parseIni(await fs.readFile(path.join(this.home, "config.ini"), "utf8"));
+    } catch {
+      return {};
+    }
+  }
+  async blobInfo() {
+    const dir = path.join(this.home, "blobs");
+    let names;
+    let dirStamp;
+    try {
+      dirStamp = (await fs.stat(dir)).mtimeMs;
+      names = await fs.readdir(dir);
+    } catch {
+      return null;
+    }
+    const key = `${dirStamp}:${names.length}`;
+    if (this.blobs?.key === key)
+      return this.blobs.info;
+    const blobs = [];
+    let indexBytes = 0;
+    for (const name of names) {
+      try {
+        const st = await fs.stat(path.join(dir, name));
+        if (!st.isFile())
+          continue;
+        if (name.endsWith(".idx"))
+          indexBytes += st.size;
+        else
+          blobs.push({ id: name, bytes: st.size, modified: st.mtimeMs, preview: "" });
       } catch {}
     }
-    return { count, bytes };
-  }
-  aggregateEvents(files, events) {
-    const handlerMap = new Map;
-    let inTokens = 0;
-    let outTokens = 0;
-    let savedTokens = 0;
-    for (const event of events) {
-      inTokens += event.inTokens;
-      outTokens += event.outTokens;
-      const saved = Math.max(0, event.inTokens - event.outTokens);
-      savedTokens += saved;
-      const existing = handlerMap.get(event.name);
-      if (existing) {
-        existing.calls += 1;
-        existing.inTokens += event.inTokens;
-        existing.outTokens += event.outTokens;
-        existing.savedTokens += saved;
-      } else {
-        handlerMap.set(event.name, {
-          name: event.name,
-          calls: 1,
-          inTokens: event.inTokens,
-          outTokens: event.outTokens,
-          savedTokens: saved
-        });
-      }
+    blobs.sort((a, b) => b.bytes - a.bytes);
+    const largest = blobs.slice(0, 5);
+    for (const blob of largest) {
+      const idx = await this.readJson(path.join(dir, `${blob.id}.idx`));
+      if (isRecord(idx))
+        blob.preview = str(idx.preview).slice(0, 160);
     }
-    const handlers = [...handlerMap.values()].sort((a, b) => b.savedTokens - a.savedTokens);
-    return {
-      sessionFiles: files.length,
-      events: events.length,
-      inTokens,
-      outTokens,
-      savedTokens,
-      handlers
-    };
-  }
-  async getStats(scope = {}) {
-    const generatedAt = Date.now();
-    const emptyScope = { kind: "all", label: "All time" };
-    let sessionEntries;
-    try {
-      sessionEntries = await fs2.readdir(this.sessionsDir);
-    } catch {
-      return {
-        ok: true,
-        squeezHome: this.squeezHome,
-        generatedAt,
-        reason: "storage-missing",
-        live: null,
-        allTime: null,
-        scoped: null,
-        scope: emptyScope,
-        pricing: null,
-        sessions: [],
-        daily: [],
-        blobs: null
-      };
+    let oldest = null;
+    let newest = null;
+    let bytes = 0;
+    for (const b of blobs) {
+      bytes += b.bytes;
+      if (oldest === null || b.modified < oldest)
+        oldest = b.modified;
+      if (newest === null || b.modified > newest)
+        newest = b.modified;
     }
-    let live = null;
-    const currentRaw = await this.readJson(path2.join(this.sessionsDir, "current.json"));
-    if (isRecord(currentRaw)) {
-      const sessionFile = str(currentRaw.session_file);
-      const events = sessionFile ? await this.readSessionEvents(sessionFile) : [];
-      let inTokens = 0;
-      let outTokens = 0;
-      for (const event of events) {
-        inTokens += event.inTokens;
-        outTokens += event.outTokens;
-      }
-      live = {
-        sessionFile,
-        startedAt: num(currentRaw.start_ts) * 1000,
-        totalTokens: num(currentRaw.total_tokens),
-        tokensSaved: num(currentRaw.tokens_saved),
-        totalCalls: num(currentRaw.total_calls),
-        overheadTokens: num(currentRaw.overhead_tokens),
-        events: events.length,
-        inTokens,
-        outTokens
-      };
-    }
-    const jsonlNames = sessionEntries.filter((entry) => dayFromFileName(entry) !== null).sort().slice(-MAX_SESSION_FILES);
-    const files = [];
-    for (const name of jsonlNames) {
-      const day = dayFromFileName(name);
-      const hourStart = hourFromFileName(name);
-      if (!day || hourStart === null)
-        continue;
-      files.push({
-        name,
-        stem: name.replace(/\.jsonl$/, ""),
-        day,
-        hourStart,
-        events: await this.readSessionEvents(name)
-      });
-    }
-    let selectedFiles = files;
-    let scopedEvents = null;
-    let scopeEcho = emptyScope;
-    let windowStart = 0;
-    let windowEnd = generatedAt;
-    if (scope.session) {
-      selectedFiles = files.filter((f) => f.stem === scope.session);
-      const file = selectedFiles[0];
-      scopeEcho = {
-        kind: "session",
-        label: file ? `Session log ${file.stem}` : `Session ${scope.session} (not found)`
-      };
-      if (file) {
-        windowStart = file.hourStart;
-        windowEnd = file.hourStart + 3599999;
-        scopedEvents = file.events;
-      } else {
-        scopedEvents = [];
-      }
-    } else if (scope.from || scope.to) {
-      const fromMs = scope.from ? dayStartMs(scope.from) : null;
-      const toMs = scope.to ? dayStartMs(scope.to) : null;
-      const startMs = fromMs ?? 0;
-      const endMs = toMs !== null ? toMs + 86399999 : generatedAt;
-      selectedFiles = files.filter((f) => f.hourStart + 3600000 > startMs && f.hourStart <= endMs);
-      scopedEvents = [];
-      for (const file of selectedFiles) {
-        for (const event of file.events) {
-          if (event.ts >= startMs && event.ts <= endMs)
-            scopedEvents.push(event);
-        }
-      }
-      scopeEcho = {
-        kind: "range",
-        label: scope.from && scope.to ? `${scope.from} → ${scope.to}` : scope.from ? `Since ${scope.from}` : `Until ${scope.to}`
-      };
-      windowStart = startMs;
-      windowEnd = endMs;
-    } else {
-      const starts = files.map((f) => f.hourStart);
-      windowStart = starts.length > 0 ? Math.min(...starts) : 0;
-    }
-    const sessions = files.map((f) => ({
-      stem: f.stem,
-      startedAt: f.hourStart,
-      events: f.events.length,
-      savedTokens: f.events.reduce((sum, e) => sum + Math.max(0, e.inTokens - e.outTokens), 0)
-    })).sort((a, b) => b.startedAt - a.startedAt);
-    const handlers = await this.readHandlers();
-    let allTime = null;
-    let scoped = null;
-    if (scopedEvents !== null) {
-      scoped = this.aggregateEvents(selectedFiles, scopedEvents);
-    } else {
-      let totalEvents = 0;
-      let eventsIn = 0;
-      let eventsOut = 0;
-      for (const file of files) {
-        for (const event of file.events) {
-          totalEvents += 1;
-          eventsIn += event.inTokens;
-          eventsOut += event.outTokens;
-        }
-      }
-      const handlerCalls = handlers.reduce((sum, h) => sum + h.calls, 0);
-      const handlerIn = handlers.reduce((sum, h) => sum + h.inTokens, 0);
-      const handlerOut = handlers.reduce((sum, h) => sum + h.outTokens, 0);
-      if (handlers.length > 0 || totalEvents > 0) {
-        const inTokens = handlerIn > 0 ? handlerIn : eventsIn;
-        const outTokens = handlerOut > 0 ? handlerOut : eventsOut;
-        allTime = {
-          totalCalls: handlerCalls > 0 ? handlerCalls : totalEvents,
-          inTokens,
-          outTokens,
-          savedTokens: Math.max(0, inTokens - outTokens),
-          sessionFiles: files.length,
-          events: totalEvents,
-          handlers
-        };
-      }
-    }
-    const savedForPricing = scoped ? scoped.savedTokens : allTime?.savedTokens ?? 0;
-    const pricing = await this.pricing.price(windowStart, windowEnd, savedForPricing);
-    const dayMap = new Map;
-    for (const file of selectedFiles) {
-      const events = scope.from || scope.to ? file.events.filter((e) => e.ts >= windowStart && e.ts <= windowEnd) : file.events;
-      const point = dayMap.get(file.day) ?? {
-        day: file.day,
-        events: 0,
-        inTokens: 0,
-        outTokens: 0,
-        savedTokens: 0
-      };
-      for (const event of events) {
-        point.events += 1;
-        point.inTokens += event.inTokens;
-        point.outTokens += event.outTokens;
-      }
-      point.savedTokens = Math.max(0, point.inTokens - point.outTokens);
-      dayMap.set(file.day, point);
-    }
-    const daily = [...dayMap.values()].sort((a, b) => a.day.localeCompare(b.day));
-    const blobs = await this.readBlobs();
-    return {
-      ok: true,
-      squeezHome: this.squeezHome,
-      generatedAt,
-      live,
-      allTime,
-      scoped,
-      scope: scopeEcho,
-      pricing,
-      sessions,
-      daily,
-      blobs
-    };
+    const info = { count: blobs.length, bytes, indexBytes, oldest, newest, largest };
+    this.blobs = { key, info };
+    return info;
   }
 }
 
@@ -661,8 +876,7 @@ if (!Number.isInteger(port) || port <= 0 || !token) {
   console.error("[squeez-stats] OPENCHAMBER_SERVICE_PORT and OPENCHAMBER_SERVICE_TOKEN are required");
   process.exit(1);
 }
-var store = new StatsStore(resolveSqueezHome());
-var DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+var store = new SqueezStore(resolveSqueezHome());
 function sendJson(res, status, body) {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
@@ -671,6 +885,78 @@ function sendJson(res, status, body) {
   });
   res.end(payload);
 }
+function msParam(url, name, fallback) {
+  const raw = (url.searchParams.get(name) ?? "").trim();
+  if (!/^\d{1,15}$/.test(raw))
+    return fallback;
+  return Number(raw);
+}
+async function meta() {
+  const available = await store.exists();
+  const events = available ? await store.events() : [];
+  return {
+    home: store.home,
+    available,
+    generatedAt: Date.now(),
+    firstEvent: events[0]?.ts ?? null,
+    lastEvent: events[events.length - 1]?.ts ?? null
+  };
+}
+async function starts() {
+  const [{ records }, current] = await Promise.all([store.summaryRecords(), store.current()]);
+  return sessionStarts(records, current);
+}
+var routes = {
+  "/status": async (url) => {
+    const now = Date.now();
+    const report = buildWindowReport(await store.events(), [], msParam(url, "start", 0), msParam(url, "end", now + 1));
+    return { meta: await meta(), shell: report.shell, tools: report.tools };
+  },
+  "/overview": async (url) => {
+    const now = Date.now();
+    const report = buildWindowReport(await store.events(), await starts(), msParam(url, "start", 0), msParam(url, "end", now + 1));
+    return { meta: await meta(), report };
+  },
+  "/sessions": async (url) => {
+    const now = Date.now();
+    const [{ records }, current] = await Promise.all([store.summaryRecords(), store.current()]);
+    const result = buildSessions(await store.events(), records, current, msParam(url, "start", 0), msParam(url, "end", now + 1), now);
+    return { meta: await meta(), ...result };
+  },
+  "/session": async (url) => {
+    const [{ records }, current] = await Promise.all([store.summaryRecords(), store.current()]);
+    const detail = buildSessionDetail(await store.events(), records, current, msParam(url, "start", -1), Date.now());
+    return { meta: await meta(), ...detail };
+  },
+  "/now": async () => {
+    const [current, context, events] = await Promise.all([store.current(), store.context(), store.events()]);
+    const report = current ? buildWindowReport(events, await starts(), current.start, Date.now() + 1) : null;
+    return {
+      meta: await meta(),
+      current,
+      context: trimContext(context),
+      contextMatches: !!current && !!context && context.sessionFile === current.sessionFile,
+      report
+    };
+  },
+  "/storage": async () => {
+    const [logs, summaries, blobs, handlers, config] = await Promise.all([
+      store.logInfo(),
+      store.summaryRecords(),
+      store.blobInfo(),
+      store.handlerRows(),
+      store.config()
+    ]);
+    return {
+      meta: await meta(),
+      logs,
+      summaries: summaries.info,
+      blobs,
+      handlers: handlerSummary(handlers, HANDLER_TABLE_MAX),
+      config: Object.entries(config).map(([key, value]) => ({ key, value }))
+    };
+  }
+};
 var server = http.createServer(async (req, res) => {
   if (req.headers.authorization !== `Bearer ${token}`) {
     sendJson(res, 401, { error: "unauthorized" });
@@ -682,23 +968,12 @@ var server = http.createServer(async (req, res) => {
       sendJson(res, 200, { ok: true });
       return;
     }
-    if (req.method === "GET" && url.pathname === "/stats") {
-      const scope = {};
-      const session = (url.searchParams.get("session") ?? "").trim();
-      const from = (url.searchParams.get("from") ?? "").trim();
-      const to = (url.searchParams.get("to") ?? "").trim();
-      if (session && /^\d{4}-\d{2}-\d{2}-\d{2}$/.test(session))
-        scope.session = session;
-      else {
-        if (DAY_RE.test(from))
-          scope.from = from;
-        if (DAY_RE.test(to))
-          scope.to = to;
-      }
-      sendJson(res, 200, await store.getStats(scope));
+    const route = req.method === "GET" ? routes[url.pathname] : undefined;
+    if (!route) {
+      sendJson(res, 404, { error: "not found" });
       return;
     }
-    sendJson(res, 404, { error: "not found" });
+    sendJson(res, 200, await route(url));
   } catch (error) {
     sendJson(res, 500, {
       error: error instanceof Error ? error.message : String(error)
@@ -706,5 +981,5 @@ var server = http.createServer(async (req, res) => {
   }
 });
 server.listen(port, "127.0.0.1", () => {
-  console.log(`[squeez-stats] listening on 127.0.0.1:${port} (home: ${store.squeezHome})`);
+  console.log(`[squeez-stats] listening on 127.0.0.1:${port} (home: ${store.home})`);
 });

@@ -1,9 +1,9 @@
 {
     "name": "openchamber-squeez-stats",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "private": true,
     "type": "module",
-    "description": "OpenChamber extension: squeez compression stats in a side panel",
+    "description": "OpenChamber extension: everything squeez records, counted from its own files",
     "openchamber": {
         "apiVersion": 1,
         "engines": {
@@ -19,7 +19,7 @@
             "statusSection": {
                 "entry": "panel/index.html",
                 "title": "Squeez",
-                "height": 84
+                "height": 64
             },
             "service": {
                 "entry": "service/main.js",
@@ -31,13 +31,15 @@
         "build": "bun run build:panel && bun run build:service",
         "build:panel": "bunx openchamber-guest-bundle panel/main.ts panel/main.js",
         "build:service": "bunx openchamber-guest-bundle --node service/main.ts service/main.js",
-        "typecheck": "tsc --noEmit",
+        "typecheck": "tsc --noEmit && tsc --noEmit -p tests",
+        "test": "bun test",
         "smoke": "node scripts/smoke.mjs"
     },
     "dependencies": {
         "@openchamber/sdk": "^2.1.0"
     },
     "devDependencies": {
+        "@types/bun": "^1.4.4",
         "@types/node": "^25.5.0",
         "typescript": "^5.9.2"
     }
