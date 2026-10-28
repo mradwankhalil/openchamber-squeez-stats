@@ -21,6 +21,7 @@ import type { HostReadyContext } from "@openchamber/sdk"
 import { applyHostReady, mountBanner, mountButton, mountSelect, mountSwitch, mountTabs, mountTextField } from "@openchamber/sdk/ui"
 import type { BannerHandle, ButtonHandle, TabsHandle } from "@openchamber/sdk/ui"
 import { DEFAULT_LIMITS, LIMIT_MAX, LIMIT_MIN } from "../service/report"
+import { formatRefreshedAt, initializeSurface } from "./startup"
 import type {
     CommandRow,
     CountRow,
@@ -170,6 +171,7 @@ type Notice = {
 }
 
 let mounted = false
+let initialized = false
 let surface: "panel" | "status" = "panel"
 let view: View = "overview"
 let range: Range = "30d"
@@ -185,6 +187,7 @@ let lastRenderedKey = ""
 /** request of the last render; a different one starts at the top */
 let lastRequestKey = ""
 let lastPayload: unknown = null
+let lastRefreshedAt: number | null = null
 /** locations typed in Settings but not saved yet */
 let draftPaths: Record<PathKey, string> = { home: "", sessions: "", summaries: "", blobs: "", config: "" }
 /** a /locations answer for the draft, from "Check" */
@@ -192,6 +195,7 @@ let draftLocations: LocationsPayload | null = null
 
 let refs: {
     subtitle: HTMLElement
+    lastRefreshed: HTMLElement
     tabsRow: HTMLElement
     rangeRow: HTMLElement
     notice: HTMLElement
@@ -1180,10 +1184,13 @@ function mountPanel(): void {
     const heading = el("div", "sq-heading")
     heading.append(el("h1", "sq-title", "Squeez"), el("div", "sq-subtitle-line", ""))
     const actions = el("div", "sq-actions")
+    const actionArea = el("div", "sq-action-area")
+    const lastRefreshed = el("div", "sq-last-refreshed", formatRefreshedAt(null))
     const refreshButton = mountButton(actions, {
         label: "Refresh",
         variant: "ghost",
         size: "sm",
+        disabled: !initialized,
         onClick: () => {
             lastRenderedKey = ""
             void refresh(true)
@@ -1193,9 +1200,11 @@ function mountPanel(): void {
         label: "Settings",
         variant: "ghost",
         size: "sm",
+        disabled: !initialized,
         onClick: () => (view === "settings" ? closeSettings() : openSettings()),
     })
-    header.append(heading, actions)
+    actionArea.append(actions, lastRefreshed)
+    header.append(heading, actionArea)
 
     const tabsRow = el("div", "sq-tabs")
     const tabs = mountTabs(tabsRow, {
@@ -1232,12 +1241,13 @@ function mountPanel(): void {
 
     const noticeEl = el("div", "sq-notice")
     const body = el("div", "sq-body")
-    body.appendChild(el("p", "sq-explain", "Loading…"))
+    body.appendChild(loadingFeedback("Loading saved settings", "Reading your refresh preferences and file locations from OpenChamber."))
     panel.append(header, tabsRow, rangeRow, noticeEl, body)
     root.replaceChildren(panel)
 
     refs = {
         subtitle: heading.lastElementChild as HTMLElement,
+        lastRefreshed,
         tabsRow,
         rangeRow,
         notice: noticeEl,
@@ -1253,9 +1263,19 @@ function mountPanel(): void {
 /** Which header rows show for the current view. */
 function syncChrome(): void {
     if (!refs) return
-    refs.tabsRow.hidden = view === "settings"
-    refs.rangeRow.hidden = !((view === "overview" || view === "sessions") && detailStart === null)
+    refs.tabsRow.hidden = !initialized || view === "settings"
+    refs.rangeRow.hidden = !initialized || !((view === "overview" || view === "sessions") && detailStart === null)
+    refs.refresh.update({ disabled: !initialized })
     refs.settingsButton.update({ label: view === "settings" ? "Done" : "Settings" })
+    refs.settingsButton.update({ disabled: !initialized })
+}
+
+function loadingFeedback(title: string, description: string): HTMLElement {
+    const feedback = el("div", "sq-loading")
+    feedback.setAttribute("role", "status")
+    feedback.setAttribute("aria-live", "polite")
+    feedback.append(el("h2", "sq-section-title", title), el("p", "sq-explain", description))
+    return feedback
 }
 
 function mountStatus(): void {
@@ -1309,6 +1329,7 @@ async function refresh(manual = false): Promise<void> {
             throw new Error(`stats service responded with HTTP ${result.status}`)
         }
         lastPayload = JSON.parse(result.body)
+        if (request.path !== "/locations") lastRefreshedAt = Date.now()
         notice = null
     } catch (error) {
         if (seq !== fetchSeq) return
@@ -1392,6 +1413,8 @@ function renderPanel(force: boolean): void {
     if (!refs) return
     renderNotice()
     syncChrome()
+    // This lives outside the body diff: unchanged stats still get a fresh clock.
+    refs.lastRefreshed.textContent = formatRefreshedAt(lastRefreshedAt)
 
     const data = lastPayload as { meta?: { available?: boolean; home?: string; lastEvent?: number | null; generatedAt?: number } } | null
     const meta = data?.meta
@@ -1411,7 +1434,10 @@ function renderPanel(force: boolean): void {
     const content = el("div", "sq-content")
 
     if (!data) {
-        content.appendChild(el("p", "sq-explain", notice ? "" : "Loading…"))
+        if (!notice) content.appendChild(loadingFeedback(
+            "Preparing your stats",
+            "Waiting for the local service to find and read squeez’s history. A first load can take longer while the service starts and builds its cache. Nothing is uploaded.",
+        ))
     } else if (path === "/locations") renderSettings(content, data as unknown as LocationsPayload)
     else if (meta && meta.available === false) {
         content.appendChild(
@@ -1560,23 +1586,31 @@ host.onReady((ctx: HostReadyContext) => {
     applyHostReady(ctx, document.documentElement)
     surface = ctx.surface === "status" ? "status" : "panel"
     if (mounted) {
-        void refresh(false)
+        if (initialized) void refresh(false)
         return
     }
     mounted = true
-    void (async () => {
-        await loadSettings()
-        range = settings.defaultRange
-        showEmptySessions = settings.showEmptySessions
-        if (surface === "status") mountStatus()
-        else mountPanel()
-        startPolling()
-        await refresh(false)
-    })()
+    void initializeSurface({
+        mount: () => {
+            if (surface === "status") mountStatus()
+            else mountPanel()
+        },
+        loadSettings,
+        applySettings: () => {
+            range = settings.defaultRange
+            showEmptySessions = settings.showEmptySessions
+            initialized = true
+            refs?.rangeTabs.update({ activeId: range })
+            syncChrome()
+            render()
+        },
+        startPolling,
+        refresh: () => refresh(false),
+    })
 })
 
 host.onSessionLifecycle(() => {
-    if (!mounted || view === "settings") return
+    if (!initialized || view === "settings") return
     void (async () => {
         if (surface === "status") await loadSettings()
         await refresh(false)

@@ -6,6 +6,7 @@ node_modules/
 .omo/
 .claude/
 .opencode/
+.openchamber/
 sub-agents-reports/
 
 # editors and OS

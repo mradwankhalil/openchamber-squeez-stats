@@ -60,6 +60,14 @@ section in the panel says in one sentence what it counts.
 To update, use **Update** on the extension in Settings → Extensions. The built
 files are committed, so there is no build step on install.
 
+On first open, the panel shows its startup stage immediately: connecting to
+OpenChamber, loading saved settings, then preparing stats from local squeez
+history. Starting the service and building its in-memory cache can take longer
+than later refreshes. There is no guessed progress percentage. Below **Refresh**
+and **Settings**, **Last refreshed** shows the local date and time of the last
+successful stats response, including silent automatic refreshes. Failed
+requests leave that timestamp unchanged.
+
 ## First run: finding squeez's files
 
 You normally do nothing. The service looks in every place squeez keeps its
