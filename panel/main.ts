@@ -194,6 +194,7 @@ let lastRefreshedAt: number | null = null
 let draftPaths: Record<PathKey, string> = { home: "", sessions: "", summaries: "", blobs: "", config: "" }
 /** a /locations answer for the draft, from "Check" */
 let draftLocations: LocationsPayload | null = null
+let draftCheckSeq = 0
 
 let refs: {
     subtitle: HTMLElement
@@ -922,6 +923,7 @@ function applySettingsChange(options: { reschedule?: boolean; refetch?: boolean 
 }
 
 function openSettings(): void {
+    draftCheckSeq++
     view = "settings"
     detailStart = null
     draftPaths = { ...settings.paths }
@@ -933,6 +935,7 @@ function openSettings(): void {
 }
 
 function closeSettings(): void {
+    draftCheckSeq++
     view = "overview"
     refs?.tabs.update({ activeId: view })
     draftLocations = null
@@ -943,16 +946,22 @@ function closeSettings(): void {
 }
 
 async function checkDraftLocations(rescan = false): Promise<void> {
+    const seq = ++draftCheckSeq
+    const savedSeq = fetchSeq
+    const paths = JSON.stringify(draftPaths)
+    const isCurrent = () => seq === draftCheckSeq && savedSeq === fetchSeq && paths === JSON.stringify(draftPaths) && view === "settings"
     try {
         const result = await host.serviceRequest({
             method: "GET",
             path: "/locations",
             query: serviceQuery(rescan ? { rescan: "1" } : {}, draftPaths, false),
         })
+        if (!isCurrent()) return
         if (result.status !== 200) throw new Error(`stats service responded with HTTP ${result.status}`)
         draftLocations = JSON.parse(result.body) as LocationsPayload
         notice = null
     } catch (error) {
+        if (!isCurrent()) return
         notice = describeError(error)
     }
     renderPanel(true)
@@ -1102,6 +1111,7 @@ function renderLocationSettings(container: HTMLElement, saved: LocationsPayload)
             helper: `${field.help} Full ${field.kind} path.`,
             mono: true,
             onChange: (value) => {
+                draftCheckSeq++
                 draftPaths[field.key] = value
                 handle.update({ value })
             },
