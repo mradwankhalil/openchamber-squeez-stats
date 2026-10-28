@@ -29,6 +29,7 @@ section in the panel says in one sentence what it counts.
 - [Privacy and permissions](#privacy-and-permissions)
 - [Troubleshooting](#troubleshooting)
 - [Develop](#develop)
+- [Releases and update checks](#releases-and-update-checks)
 - [License](#license)
 
 ## Requirements
@@ -254,6 +255,65 @@ icon.svg            rail icon
 Service routes all take optional `home`, `sessions`, `summaries`, `blobs` and
 `config` (absolute paths) and `limits` (a JSON object of list lengths); see the
 header of `service/main.ts`.
+
+## Releases and update checks
+
+Git-installed copies receive an **Update** offer in OpenChamber's
+**Settings → Extensions** when the repository's `package.json` version is
+higher than the installed version. Code changes alone do not trigger an offer.
+Local-folder installs run directly from that folder and do not receive update
+offers; install from the repository URL to follow published updates.
+
+### Cut a release locally
+
+Commit your source changes first, including rebuilt bundles. With a clean
+working tree, normally on `main`, run:
+
+```sh
+bun run release patch --dry-run  # verify without creating a release
+bun run release patch           # fixes: 0.3.0 → 0.3.1
+# or: bun run release minor     # features: 0.3.0 → 0.4.0
+```
+
+The script runs `bun run verify` (build, typecheck, unit tests and the service
+smoke test), bumps the version, commits `package.json` and the built bundles,
+and creates an annotated `vX.Y.Z` tag. It also accepts `major` or an explicit
+higher `x.y.z` version. **It never pushes.** If verification fails, no release
+commit or tag is created; a build may leave regenerated bundles to inspect.
+
+After reviewing the release, publish separately from `main`:
+
+```sh
+git push origin main --follow-tags
+```
+
+### CI safeguards
+
+`.github/workflows/ci.yml` checks pushes and pull requests targeting `main`:
+
+- Committed `panel/main.js` and `service/main.js` must match a fresh build.
+- Typecheck, unit tests and the built-service smoke test must pass.
+- Changes to shipped files or the runtime manifest/dependencies require a
+  higher version. Documentation, tests and tooling alone need no bump.
+
+Run the same verification locally with `bun run verify`. To compare versions
+and shipped changes against a base commit, use
+`bun run check:release origin/main`.
+
+CI reports failures **after a push**; it does not reject the push or prevent
+OpenChamber from reading that commit. To block unverified merges, configure a
+GitHub branch protection rule or ruleset for `main` requiring pull requests
+and the `verify` status check. This repository's workflow does not configure
+those GitHub settings itself.
+
+### What belongs in the repository
+
+Keep runtime assets and built bundles, source, the lockfile, documentation,
+license, tests, release tooling and CI. OpenChamber installs the committed
+bundles without compiling them. `.gitignore` excludes dependencies, local
+agent/index state, reports, editor files, logs, temporary output, environment
+files and archives. It does not remove previously tracked files or rewrite
+history; obsolete tracked files must be deleted in a normal commit.
 
 ## License
 
