@@ -1128,8 +1128,9 @@ function renderLocationSettings(container: HTMLElement, saved: LocationsPayload)
         onClick: () => {
             draftPaths = { home: "", sessions: "", summaries: "", blobs: "", config: "" }
             settings.paths = { ...draftPaths }
+            draftLocations = null
             applySettingsChange({ refetch: true })
-            void checkDraftLocations(true)
+            void refresh(true, true)
         },
     })
     s.body.appendChild(actions)
@@ -1164,8 +1165,9 @@ function renderLocationSettings(container: HTMLElement, saved: LocationsPayload)
                     onClick: () => {
                         draftPaths = { home: c.path, sessions: "", summaries: "", blobs: "", config: "" }
                         settings.paths = { ...draftPaths }
+                        draftLocations = null
                         applySettingsChange({ refetch: true })
-                        void checkDraftLocations()
+                        void refresh(true)
                     },
                 })
                 li.appendChild(side)
@@ -1320,12 +1322,14 @@ function currentRequest(): { path: string; query: Record<string, string> } {
  * Fetch the current view. `manual` (a click) shows the spinner on Refresh;
  * background refreshes never do, so the header stays still.
  */
-async function refresh(manual = false): Promise<void> {
+async function refresh(manual = false, rescan = false): Promise<void> {
     const seq = ++fetchSeq
     const request = currentRequest()
     if (manual) refs?.refresh.update({ loading: true })
     try {
-        const result = await host.serviceRequest({ method: "GET", path: request.path, query: request.query })
+        // Rescanning bypasses discovery's cache, but does not change data identity.
+        const query = rescan ? { ...request.query, rescan: "1" } : request.query
+        const result = await host.serviceRequest({ method: "GET", path: request.path, query })
         if (seq !== fetchSeq) return
         if (result.status !== 200) {
             throw new Error(`stats service responded with HTTP ${result.status}`)
