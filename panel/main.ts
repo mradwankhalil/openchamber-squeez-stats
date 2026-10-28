@@ -187,6 +187,8 @@ let lastRenderedKey = ""
 /** request of the last render; a different one starts at the top */
 let lastRequestKey = ""
 let lastPayload: unknown = null
+/** Only reuse data for the endpoint, period and file locations that produced it. */
+let lastPayloadKey = ""
 let lastRefreshedAt: number | null = null
 /** locations typed in Settings but not saved yet */
 let draftPaths: Record<PathKey, string> = { home: "", sessions: "", summaries: "", blobs: "", config: "" }
@@ -1329,6 +1331,7 @@ async function refresh(manual = false): Promise<void> {
             throw new Error(`stats service responded with HTTP ${result.status}`)
         }
         lastPayload = JSON.parse(result.body)
+        lastPayloadKey = `${request.path}?${JSON.stringify(request.query)}`
         if (request.path !== "/locations") lastRefreshedAt = Date.now()
         notice = null
     } catch (error) {
@@ -1416,14 +1419,14 @@ function renderPanel(force: boolean): void {
     // This lives outside the body diff: unchanged stats still get a fresh clock.
     refs.lastRefreshed.textContent = formatRefreshedAt(lastRefreshedAt)
 
-    const data = lastPayload as { meta?: { available?: boolean; home?: string; lastEvent?: number | null; generatedAt?: number } } | null
+    const { path, query } = currentRequest()
+    const requestKey = `${path}?${JSON.stringify(query)}`
+    const data = (requestKey === lastPayloadKey ? lastPayload : null) as { meta?: { available?: boolean; home?: string; lastEvent?: number | null; generatedAt?: number } } | null
     const meta = data?.meta
     const cadence = settings.autoRefresh ? `updates every ${refreshLabel(settings.refreshSeconds)}` : "auto-refresh off"
     refs.subtitle.textContent =
         view === "settings" ? "settings" : meta?.lastEvent ? `last activity ${formatAgo(meta.lastEvent)} · ${cadence}` : cadence
 
-    const { path, query } = currentRequest()
-    const requestKey = `${path}?${JSON.stringify(query)}`
     const key = `${requestKey}|${JSON.stringify({ ...(data ?? {}), meta: { ...meta, generatedAt: 0, lastEvent: 0 } })}`
     if (!force && key === lastRenderedKey) return
     lastRenderedKey = key
@@ -1473,7 +1476,8 @@ function renderNotice(): void {
 
 function renderStatus(): void {
     if (!statusRefs) return
-    const data = lastPayload as StatusPayload | null
+    const { path, query } = currentRequest()
+    const data = (`${path}?${JSON.stringify(query)}` === lastPayloadKey ? lastPayload : null) as StatusPayload | null
     statusRefs.sub.classList.remove("sq-status-error")
     statusRefs.badge.hidden = true
 
