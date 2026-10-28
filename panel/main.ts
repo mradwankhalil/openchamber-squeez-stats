@@ -2,8 +2,14 @@
  * Squeez Stats — OpenChamber extension panel.
  *
  * One page serves two surfaces:
- *  - `panel`: the rail side panel, four views (Overview, Sessions, Now, Storage).
+ *  - `panel`: the rail side panel, four views (Overview, Sessions, Now, Storage)
+ *    and Settings.
  *  - `status`: one line in the chat's Work Status panel (today's numbers).
+ *
+ * Settings live in the extension's host storage (`host.storage`, key
+ * "settings"), so both surfaces read the same values. Nothing about this
+ * machine is built in: squeez's folder is discovered by the service, and the
+ * user can point every file somewhere else.
  *
  * The page is a thin view: the local service reads squeez's files and returns
  * finished numbers. Every section carries one sentence saying what it counts.
@@ -12,11 +18,14 @@
 
 import { connectHost, HostRequestError } from "@openchamber/sdk"
 import type { HostReadyContext } from "@openchamber/sdk"
-import { applyHostReady, mountBanner, mountButton, mountSwitch, mountTabs } from "@openchamber/sdk/ui"
+import { applyHostReady, mountBanner, mountButton, mountSelect, mountSwitch, mountTabs, mountTextField } from "@openchamber/sdk/ui"
 import type { BannerHandle, ButtonHandle, TabsHandle } from "@openchamber/sdk/ui"
+import { DEFAULT_LIMITS, LIMIT_MAX, LIMIT_MIN } from "../service/report"
 import type {
     CommandRow,
     CountRow,
+    ListLimits,
+    LocationsPayload,
     NowPayload,
     OverviewPayload,
     SeriesPoint,
@@ -28,12 +37,124 @@ import type {
     WindowReport,
 } from "../service/report"
 
-const PANEL_POLL_MS = 5000
-const STATUS_POLL_MS = 10000
-
-type View = "overview" | "sessions" | "now" | "storage"
+type View = "overview" | "sessions" | "now" | "storage" | "settings"
 type Range = "today" | "7d" | "30d" | "all"
 type Metric = "saved" | "commands" | "tools"
+
+// ------------------------------------------------------------------ settings
+
+type PathKey = "home" | "sessions" | "summaries" | "blobs" | "config"
+type ListKey = keyof ListLimits
+
+type Settings = {
+    autoRefresh: boolean
+    refreshSeconds: number
+    defaultRange: Range
+    showEmptySessions: boolean
+    limits: ListLimits
+    /** empty string = found automatically */
+    paths: Record<PathKey, string>
+}
+
+const SETTINGS_KEY = "settings"
+const PATH_KEYS: PathKey[] = ["home", "sessions", "summaries", "blobs", "config"]
+const RANGES: Range[] = ["today", "7d", "30d", "all"]
+const RANGE_LABELS: Record<Range, string> = { today: "Today", "7d": "7 days", "30d": "30 days", all: "All" }
+const REFRESH_CHOICES = [15, 30, 60, 120, 300, 600, 1800]
+const LIMIT_CHOICES = [3, 5, 8, 10, 12, 15, 20, 30, 50]
+
+const PATH_FIELDS: { key: PathKey; label: string; help: string; kind: "folder" | "file" }[] = [
+    { key: "home", label: "squeez folder", help: "Where squeez keeps its state. The other locations default to places inside it.", kind: "folder" },
+    { key: "sessions", label: "Event logs folder", help: "Holds the hourly YYYY-MM-DD-HH.jsonl logs, current.json and context.json. Required.", kind: "folder" },
+    { key: "summaries", label: "Session records file", help: "summaries.jsonl, one record per finished session.", kind: "file" },
+    { key: "blobs", label: "Stashed outputs folder", help: "Oversized outputs squeez set aside.", kind: "folder" },
+    { key: "config", label: "squeez config file", help: "config.ini.", kind: "file" },
+]
+
+const LIST_FIELDS: { key: ListKey; label: string; group: "Overview and sessions" | "Now" }[] = [
+    { key: "topCommands", label: "Where the savings come from", group: "Overview and sessions" },
+    { key: "weakCommands", label: "What squeez barely shortens", group: "Overview and sessions" },
+    { key: "largestOutputs", label: "Biggest single outputs", group: "Overview and sessions" },
+    { key: "toolsByName", label: "Tool outputs", group: "Overview and sessions" },
+    { key: "errors", label: "Errors in shell output", group: "Overview and sessions" },
+    { key: "files", label: "Files mentioned", group: "Overview and sessions" },
+    { key: "git", label: "Git activity", group: "Overview and sessions" },
+    { key: "tests", label: "Test results", group: "Overview and sessions" },
+    { key: "recentCalls", label: "Latest calls", group: "Now" },
+    { key: "repeatedErrors", label: "Recurring errors", group: "Now" },
+    { key: "fileEdits", label: "Most-edited files", group: "Now" },
+    { key: "repeatedCommands", label: "Repeated commands", group: "Now" },
+]
+
+function defaultSettings(): Settings {
+    return {
+        autoRefresh: true,
+        refreshSeconds: 60,
+        defaultRange: "30d",
+        showEmptySessions: false,
+        limits: { ...DEFAULT_LIMITS },
+        paths: { home: "", sessions: "", summaries: "", blobs: "", config: "" },
+    }
+}
+
+/** Stored settings are untrusted: keep known fields with valid values. */
+function normalizeSettings(raw: unknown): Settings {
+    const out = defaultSettings()
+    if (!raw || typeof raw !== "object") return out
+    const r = raw as Record<string, unknown>
+    if (typeof r.autoRefresh === "boolean") out.autoRefresh = r.autoRefresh
+    const secs = Number(r.refreshSeconds)
+    if (Number.isFinite(secs)) out.refreshSeconds = Math.min(3600, Math.max(5, Math.round(secs)))
+    if (typeof r.defaultRange === "string" && (RANGES as string[]).includes(r.defaultRange)) out.defaultRange = r.defaultRange as Range
+    if (typeof r.showEmptySessions === "boolean") out.showEmptySessions = r.showEmptySessions
+    if (r.limits && typeof r.limits === "object") {
+        const l = r.limits as Record<string, unknown>
+        for (const key of Object.keys(DEFAULT_LIMITS) as ListKey[]) {
+            const v = Number(l[key])
+            if (Number.isFinite(v)) out.limits[key] = Math.min(LIMIT_MAX, Math.max(LIMIT_MIN, Math.round(v)))
+        }
+    }
+    if (r.paths && typeof r.paths === "object") {
+        const p = r.paths as Record<string, unknown>
+        for (const key of PATH_KEYS) if (typeof p[key] === "string") out.paths[key] = (p[key] as string).trim()
+    }
+    return out
+}
+
+let settings: Settings = defaultSettings()
+let settingsProblem: string | null = null
+
+async function loadSettings(): Promise<void> {
+    try {
+        settings = normalizeSettings(await host.storage.get(SETTINGS_KEY))
+        settingsProblem = null
+    } catch (error) {
+        settingsProblem = `Saved settings could not be read (${error instanceof Error ? error.message : String(error)}); using defaults.`
+    }
+}
+
+async function saveSettings(): Promise<void> {
+    try {
+        await host.storage.set(SETTINGS_KEY, settings as unknown as Parameters<typeof host.storage.set>[1])
+        settingsProblem = null
+    } catch (error) {
+        settingsProblem = `Settings could not be saved (${error instanceof Error ? error.message : String(error)}). They apply until the panel reloads.`
+    }
+}
+
+function refreshLabel(seconds: number): string {
+    if (seconds < 60) return `${seconds} seconds`
+    if (seconds % 60 === 0) return seconds === 60 ? "1 minute" : `${seconds / 60} minutes`
+    return `${seconds} seconds`
+}
+
+/** The query every data request carries: the user's locations and list lengths. */
+function serviceQuery(base: Record<string, string>, paths: Record<PathKey, string> = settings.paths, withLimits = true): Record<string, string> {
+    const query = { ...base }
+    for (const key of PATH_KEYS) if (paths[key].trim()) query[key] = paths[key].trim()
+    if (withLimits) query.limits = JSON.stringify(settings.limits)
+    return query
+}
 
 const host = connectHost()
 const rootElement = document.querySelector<HTMLElement>("#root")
@@ -51,7 +172,7 @@ type Notice = {
 let mounted = false
 let surface: "panel" | "status" = "panel"
 let view: View = "overview"
-let range: Range = "today"
+let range: Range = "30d"
 let metric: Metric = "saved"
 let detailStart: number | null = null
 let showEmptySessions = false
@@ -64,13 +185,19 @@ let lastRenderedKey = ""
 /** request of the last render; a different one starts at the top */
 let lastRequestKey = ""
 let lastPayload: unknown = null
+/** locations typed in Settings but not saved yet */
+let draftPaths: Record<PathKey, string> = { home: "", sessions: "", summaries: "", blobs: "", config: "" }
+/** a /locations answer for the draft, from "Check" */
+let draftLocations: LocationsPayload | null = null
 
 let refs: {
     subtitle: HTMLElement
+    tabsRow: HTMLElement
     rangeRow: HTMLElement
     notice: HTMLElement
     body: HTMLElement
     refresh: ButtonHandle
+    settingsButton: ButtonHandle
     tabs: TabsHandle
     rangeTabs: TabsHandle
 } | null = null
@@ -441,6 +568,8 @@ function renderSessions(container: HTMLElement, data: SessionsPayload): void {
         checked: showEmptySessions,
         onChange: (next) => {
             showEmptySessions = next
+            settings.showEmptySessions = next
+            void saveSettings()
             renderPanel(true)
         },
     })
@@ -670,7 +799,16 @@ function renderNow(container: HTMLElement, data: NowPayload): void {
 
 function renderStorage(container: HTMLElement, data: StoragePayload): void {
     container.appendChild(el("p", "sq-explain", "What squeez keeps on disk, and its settings."))
-    container.appendChild(kvList([["squeez home", data.meta.home]]))
+    const p = data.meta.paths
+    container.appendChild(
+        kvList([
+            ["squeez folder", `${p.home}${data.meta.pathSource === "auto" ? "  (found automatically)" : ""}`],
+            ["Event logs", p.sessionsDir],
+            ["Session records", p.summariesFile],
+            ["Stashed outputs", p.blobsDir],
+            ["Config", p.configFile],
+        ]),
+    )
 
     const logs = data.logs
     const l = section("Event logs", "One file per session-start hour. Every number in this panel is counted from these events.")
@@ -757,6 +895,282 @@ function renderStorage(container: HTMLElement, data: StoragePayload): void {
     }
 }
 
+// ------------------------------------------------------------------ settings view
+
+/** A labelled row in the settings form. */
+function settingRow(container: HTMLElement, help?: string): HTMLElement {
+    const row = el("div", "sq-setting")
+    const control = el("div", "sq-setting-control")
+    row.appendChild(control)
+    if (help) row.appendChild(el("p", "sq-explain sq-setting-help", help))
+    container.appendChild(row)
+    return control
+}
+
+function applySettingsChange(options: { reschedule?: boolean; refetch?: boolean } = {}): void {
+    void saveSettings().then(() => {
+        if (options.reschedule) schedulePoll()
+        if (settingsProblem) renderPanel(true)
+    })
+    if (options.refetch) lastRenderedKey = ""
+}
+
+function openSettings(): void {
+    view = "settings"
+    detailStart = null
+    draftPaths = { ...settings.paths }
+    draftLocations = null
+    lastRenderedKey = ""
+    refs?.body.replaceChildren(el("p", "sq-explain", "Loading…"))
+    syncChrome()
+    void refresh(true)
+}
+
+function closeSettings(): void {
+    view = "overview"
+    refs?.tabs.update({ activeId: view })
+    draftLocations = null
+    lastRenderedKey = ""
+    refs?.body.replaceChildren(el("p", "sq-explain", "Loading…"))
+    syncChrome()
+    void refresh(true)
+}
+
+async function checkDraftLocations(rescan = false): Promise<void> {
+    try {
+        const result = await host.serviceRequest({
+            method: "GET",
+            path: "/locations",
+            query: serviceQuery(rescan ? { rescan: "1" } : {}, draftPaths, false),
+        })
+        if (result.status !== 200) throw new Error(`stats service responded with HTTP ${result.status}`)
+        draftLocations = JSON.parse(result.body) as LocationsPayload
+        notice = null
+    } catch (error) {
+        notice = describeError(error)
+    }
+    renderPanel(true)
+}
+
+function renderSettings(container: HTMLElement, saved: LocationsPayload): void {
+    const back = el("div", "sq-back")
+    mountButton(back, { label: "← Back to stats", variant: "ghost", size: "sm", onClick: closeSettings })
+    container.appendChild(back)
+    container.appendChild(el("p", "sq-explain", "Saved for this extension and shared by the panel and the Work Status line."))
+    if (settingsProblem) container.appendChild(note(settingsProblem, "warning"))
+
+    // refresh
+    const r = section("Refreshing", "How often the numbers update by themselves. Refresh in the header always updates now.")
+    mountSwitch(settingRow(r.body), {
+        label: "Refresh automatically",
+        checked: settings.autoRefresh,
+        description: settings.autoRefresh ? `every ${refreshLabel(settings.refreshSeconds)}` : "only when you press Refresh or a chat starts or ends",
+        onChange: (next) => {
+            settings.autoRefresh = next
+            applySettingsChange({ reschedule: true })
+            renderPanel(true)
+        },
+    })
+    const choices = REFRESH_CHOICES.includes(settings.refreshSeconds) ? REFRESH_CHOICES : [...REFRESH_CHOICES, settings.refreshSeconds].sort((a, b) => a - b)
+    mountSelect(settingRow(r.body), {
+        label: "Refresh every",
+        value: String(settings.refreshSeconds),
+        options: choices.map((s) => ({ id: String(s), label: refreshLabel(s) })),
+        disabled: !settings.autoRefresh,
+        onChange: (id) => {
+            settings.refreshSeconds = Number(id)
+            applySettingsChange({ reschedule: true })
+            renderPanel(true)
+        },
+    })
+    container.appendChild(r.root)
+
+    // display
+    const d = section("Display")
+    mountSelect(settingRow(d.body, "The period Overview and Sessions show when the panel opens."), {
+        label: "Default period",
+        value: settings.defaultRange,
+        options: RANGES.map((id) => ({ id, label: RANGE_LABELS[id] })),
+        onChange: (id) => {
+            settings.defaultRange = id as Range
+            range = settings.defaultRange
+            refs?.rangeTabs.update({ activeId: range })
+            applySettingsChange()
+            renderPanel(true)
+        },
+    })
+    mountSwitch(settingRow(d.body), {
+        label: "Show empty sessions",
+        checked: settings.showEmptySessions,
+        description: "Sessions that started and ended without running anything.",
+        onChange: (next) => {
+            settings.showEmptySessions = next
+            showEmptySessions = next
+            applySettingsChange()
+            renderPanel(true)
+        },
+    })
+    container.appendChild(d.root)
+
+    // list lengths
+    const lists = section("List lengths", "How many rows each list shows.")
+    for (const group of ["Overview and sessions", "Now"] as const) {
+        lists.body.appendChild(el("h3", "sq-subtitle", group))
+        const grid = el("div", "sq-setting-grid")
+        for (const field of LIST_FIELDS.filter((f) => f.group === group)) {
+            const current = settings.limits[field.key]
+            const options = LIMIT_CHOICES.includes(current) ? LIMIT_CHOICES : [...LIMIT_CHOICES, current].sort((a, b) => a - b)
+            mountSelect(settingRow(grid), {
+                label: field.label,
+                value: String(current),
+                options: options.map((n) => ({ id: String(n), label: `${n} rows` })),
+                onChange: (id) => {
+                    settings.limits[field.key] = Number(id)
+                    applySettingsChange({ refetch: true })
+                    renderPanel(true)
+                },
+            })
+        }
+        lists.body.appendChild(grid)
+    }
+    container.appendChild(lists.root)
+
+    renderLocationSettings(container, saved)
+
+    const reset = section("Reset")
+    mountButton(settingRow(reset.body, "Back to the defaults: refresh every minute, 30 days, default list lengths, locations found automatically."), {
+        label: "Reset all settings",
+        variant: "outline",
+        size: "sm",
+        onClick: () => {
+            settings = defaultSettings()
+            range = settings.defaultRange
+            showEmptySessions = settings.showEmptySessions
+            draftPaths = { ...settings.paths }
+            draftLocations = null
+            refs?.rangeTabs.update({ activeId: range })
+            applySettingsChange({ reschedule: true, refetch: true })
+            void refresh(true)
+        },
+    })
+    container.appendChild(reset.root)
+}
+
+function renderLocationSettings(container: HTMLElement, saved: LocationsPayload): void {
+    const shown = draftLocations ?? saved
+    const s = section(
+        "squeez's files",
+        "Found automatically: the folder squeez last wrote to among the places it can live. If that is wrong, or nothing was found, enter the locations here. Leave a field empty to use the default inside the squeez folder.",
+    )
+
+    const missingRequired = shown.checks.some((c) => c.required && !c.exists)
+    s.body.appendChild(
+        note(
+            missingRequired
+                ? "squeez's event logs were not found at the location below. Pick the right squeez folder, or enter the event logs folder."
+                : `${shown.pathSource === "auto" ? "Found automatically" : "Using your locations"}: everything the panel needs is there.`,
+            missingRequired ? "warning" : undefined,
+        ),
+    )
+
+    const status = el("ul", "sq-list sq-checks")
+    for (const check of shown.checks) {
+        const field = PATH_FIELDS.find((f) => f.key === check.id)
+        const li = el("li", "sq-list-row")
+        const text = el("span", "sq-list-text")
+        text.append(el("span", "sq-check-label", field?.label ?? check.id), el("span", "sq-check-path sq-mono", check.path))
+        text.title = check.path
+        const mark = el("span", "sq-check-mark", check.exists ? "found" : check.required ? "missing" : "not there")
+        mark.dataset.state = check.exists ? "ok" : check.required ? "bad" : "absent"
+        li.append(text, mark)
+        status.appendChild(li)
+    }
+    s.body.appendChild(status)
+
+    for (const field of PATH_FIELDS) {
+        const resolved = shown.checks.find((c) => c.id === field.key)?.path ?? ""
+        const handle = mountTextField(settingRow(s.body), {
+            label: field.label,
+            value: draftPaths[field.key],
+            placeholder: resolved ? `automatic: ${resolved}` : "automatic",
+            helper: `${field.help} Full ${field.kind} path.`,
+            mono: true,
+            onChange: (value) => {
+                draftPaths[field.key] = value
+                handle.update({ value })
+            },
+        })
+    }
+
+    const actions = el("div", "sq-setting-actions")
+    mountButton(actions, { label: "Check", variant: "outline", size: "sm", onClick: () => void checkDraftLocations() })
+    mountButton(actions, {
+        label: "Save locations",
+        variant: "default",
+        size: "sm",
+        onClick: () => {
+            settings.paths = { ...draftPaths }
+            draftLocations = null
+            applySettingsChange({ refetch: true })
+            void refresh(true)
+        },
+    })
+    mountButton(actions, {
+        label: "Find automatically",
+        variant: "ghost",
+        size: "sm",
+        onClick: () => {
+            draftPaths = { home: "", sessions: "", summaries: "", blobs: "", config: "" }
+            settings.paths = { ...draftPaths }
+            applySettingsChange({ refetch: true })
+            void checkDraftLocations(true)
+        },
+    })
+    s.body.appendChild(actions)
+
+    const found = shown.candidates
+    if (found.length > 0) {
+        s.body.appendChild(el("h3", "sq-subtitle", "Places squeez can live"))
+        s.body.appendChild(el("p", "sq-explain", "Every folder squeez uses for one of its hosts, checked on this machine."))
+        const list = el("ul", "sq-list")
+        for (const c of found) {
+            const li = el("li", "sq-list-row")
+            const text = el("span", "sq-list-text")
+            text.append(
+                el("span", "sq-check-path sq-mono", c.path),
+                el(
+                    "span",
+                    "sq-check-label",
+                    c.hasSessions
+                        ? `${plural(c.logFiles, "event log")}${c.lastLog ? ` · last written ${formatAgo(c.lastLog)}` : ""}${c.source === "env" ? " · from environment" : ""}`
+                        : "not here",
+                ),
+            )
+            text.title = c.path
+            li.appendChild(text)
+            if (c.hasSessions) {
+                const side = el("span", "sq-list-side")
+                mountButton(side, {
+                    label: c.path === shown.paths.home ? "In use" : "Use this",
+                    variant: "ghost",
+                    size: "xs",
+                    disabled: c.path === shown.paths.home,
+                    onClick: () => {
+                        draftPaths = { home: c.path, sessions: "", summaries: "", blobs: "", config: "" }
+                        settings.paths = { ...draftPaths }
+                        applySettingsChange({ refetch: true })
+                        void checkDraftLocations()
+                    },
+                })
+                li.appendChild(side)
+            }
+            list.appendChild(li)
+        }
+        s.body.appendChild(list)
+    }
+    container.appendChild(s.root)
+}
+
 // -------------------------------------------------------------------- mounting
 
 function mountPanel(): void {
@@ -772,8 +1186,14 @@ function mountPanel(): void {
         size: "sm",
         onClick: () => {
             lastRenderedKey = ""
-            void refresh()
+            void refresh(true)
         },
+    })
+    const settingsButton = mountButton(actions, {
+        label: "Settings",
+        variant: "ghost",
+        size: "sm",
+        onClick: () => (view === "settings" ? closeSettings() : openSettings()),
     })
     header.append(heading, actions)
 
@@ -790,28 +1210,23 @@ function mountPanel(): void {
             view = next as View
             detailStart = null
             tabs.update({ activeId: view })
-            syncRangeVisibility()
+            syncChrome()
             lastRenderedKey = ""
             refs?.body.replaceChildren(el("p", "sq-explain", "Loading…"))
-            void refresh()
+            void refresh(true)
         },
     })
 
     const rangeRow = el("div", "sq-range")
     const rangeTabs = mountTabs(rangeRow, {
-        items: [
-            { id: "today", label: "Today" },
-            { id: "7d", label: "7 days" },
-            { id: "30d", label: "30 days" },
-            { id: "all", label: "All" },
-        ],
+        items: RANGES.map((id) => ({ id, label: RANGE_LABELS[id] })),
         activeId: range,
         onChange: (next) => {
             range = next as Range
             rangeTabs.update({ activeId: range })
             detailStart = null
             lastRenderedKey = ""
-            void refresh()
+            void refresh(true)
         },
     })
 
@@ -823,19 +1238,24 @@ function mountPanel(): void {
 
     refs = {
         subtitle: heading.lastElementChild as HTMLElement,
+        tabsRow,
         rangeRow,
         notice: noticeEl,
         body,
         refresh: refreshButton,
+        settingsButton,
         tabs,
         rangeTabs,
     }
-    syncRangeVisibility()
+    syncChrome()
 }
 
-function syncRangeVisibility(): void {
+/** Which header rows show for the current view. */
+function syncChrome(): void {
     if (!refs) return
+    refs.tabsRow.hidden = view === "settings"
     refs.rangeRow.hidden = !((view === "overview" || view === "sessions") && detailStart === null)
+    refs.settingsButton.update({ label: view === "settings" ? "Done" : "Settings" })
 }
 
 function mountStatus(): void {
@@ -867,16 +1287,21 @@ function todayStart(): number {
 }
 
 function currentRequest(): { path: string; query: Record<string, string> } {
-    if (surface === "status") return { path: "/status", query: { start: String(todayStart()) } }
-    if (view === "sessions" && detailStart !== null) return { path: "/session", query: { start: String(detailStart) } }
-    if (view === "overview" || view === "sessions") return { path: `/${view}`, query: { start: String(rangeStart(range)) } }
-    return { path: `/${view}`, query: {} }
+    if (surface === "status") return { path: "/status", query: serviceQuery({ start: String(todayStart()) }, settings.paths, false) }
+    if (view === "settings") return { path: "/locations", query: serviceQuery({}, settings.paths, false) }
+    if (view === "sessions" && detailStart !== null) return { path: "/session", query: serviceQuery({ start: String(detailStart) }) }
+    if (view === "overview" || view === "sessions") return { path: `/${view}`, query: serviceQuery({ start: String(rangeStart(range)) }) }
+    return { path: `/${view}`, query: serviceQuery({}) }
 }
 
-async function refresh(): Promise<void> {
+/**
+ * Fetch the current view. `manual` (a click) shows the spinner on Refresh;
+ * background refreshes never do, so the header stays still.
+ */
+async function refresh(manual = false): Promise<void> {
     const seq = ++fetchSeq
     const request = currentRequest()
-    refs?.refresh.update({ loading: true })
+    if (manual) refs?.refresh.update({ loading: true })
     try {
         const result = await host.serviceRequest({ method: "GET", path: request.path, query: request.query })
         if (seq !== fetchSeq) return
@@ -890,8 +1315,11 @@ async function refresh(): Promise<void> {
         notice = describeError(error)
     } finally {
         if (seq === fetchSeq) {
-            refs?.refresh.update({ loading: false })
+            if (manual) refs?.refresh.update({ loading: false })
             render()
+        } else if (manual) {
+            // a newer request took over; it clears the spinner only if it is manual too
+            refs?.refresh.update({ loading: false })
         }
     }
 }
@@ -917,16 +1345,38 @@ function describeError(error: unknown): Notice {
     return { tone: "error", title: "Could not load stats", body: error instanceof Error ? error.message : String(error) }
 }
 
+/**
+ * One timer, re-armed after each refresh, at the interval from settings.
+ * Off when auto-refresh is off. Hidden pages and the settings form skip a
+ * tick (no re-render under the user's typing).
+ */
+function schedulePoll(): void {
+    if (pollTimer !== null) {
+        window.clearTimeout(pollTimer)
+        pollTimer = null
+    }
+    if (!settings.autoRefresh) return
+    pollTimer = window.setTimeout(() => {
+        pollTimer = null
+        void (async () => {
+            if (document.visibilityState === "visible" && view !== "settings") {
+                // the status line has no settings form; pick up changes made in the panel
+                if (surface === "status") await loadSettings()
+                await refresh(false)
+            }
+            schedulePoll()
+        })()
+    }, settings.refreshSeconds * 1000)
+}
+
+let visibilityHooked = false
+
 function startPolling(): void {
-    if (pollTimer !== null) return
-    pollTimer = window.setInterval(
-        () => {
-            if (document.visibilityState === "visible") void refresh()
-        },
-        surface === "status" ? STATUS_POLL_MS : PANEL_POLL_MS,
-    )
+    schedulePoll()
+    if (visibilityHooked) return
+    visibilityHooked = true
     document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "visible") void refresh()
+        if (document.visibilityState === "visible" && settings.autoRefresh && view !== "settings") void refresh(false)
     })
 }
 
@@ -941,11 +1391,13 @@ function render(): void {
 function renderPanel(force: boolean): void {
     if (!refs) return
     renderNotice()
-    syncRangeVisibility()
+    syncChrome()
 
     const data = lastPayload as { meta?: { available?: boolean; home?: string; lastEvent?: number | null; generatedAt?: number } } | null
     const meta = data?.meta
-    refs.subtitle.textContent = meta?.lastEvent ? `last activity ${formatAgo(meta.lastEvent)}` : "what squeez did, from its own files"
+    const cadence = settings.autoRefresh ? `updates every ${refreshLabel(settings.refreshSeconds)}` : "auto-refresh off"
+    refs.subtitle.textContent =
+        view === "settings" ? "settings" : meta?.lastEvent ? `last activity ${formatAgo(meta.lastEvent)} · ${cadence}` : cadence
 
     const { path, query } = currentRequest()
     const requestKey = `${path}?${JSON.stringify(query)}`
@@ -960,8 +1412,14 @@ function renderPanel(force: boolean): void {
 
     if (!data) {
         content.appendChild(el("p", "sq-explain", notice ? "" : "Loading…"))
-    } else if (meta && meta.available === false) {
-        content.appendChild(note(`squeez home not found: ${meta.home ?? ""}. If squeez lives elsewhere, set SQUEEZ_STATS_HOME for the service.`, "warning"))
+    } else if (path === "/locations") renderSettings(content, data as unknown as LocationsPayload)
+    else if (meta && meta.available === false) {
+        content.appendChild(
+            note(`squeez's event logs were not found${meta.home ? ` (looked in ${meta.home})` : ""}. Is squeez installed? If it keeps its files elsewhere, choose them in Settings.`, "warning"),
+        )
+        const open = el("div", "sq-back")
+        mountButton(open, { label: "Choose squeez's files…", variant: "default", size: "sm", onClick: openSettings })
+        content.appendChild(open)
     } else if (path === "/overview") renderOverview(content, data as unknown as OverviewPayload)
     else if (path === "/sessions") renderSessions(content, data as unknown as SessionsPayload)
     else if (path === "/session") renderSessionDetail(content, data as unknown as SessionDetailPayload)
@@ -983,7 +1441,7 @@ function renderNotice(): void {
         tone: notice.tone,
         title: notice.title,
         ...(notice.body ? { body: notice.body } : {}),
-        ...(showRetry ? { action: { label: "Retry", onClick: () => void refresh() } } : {}),
+        ...(showRetry ? { action: { label: "Retry", onClick: () => void refresh(true) } } : {}),
     })
 }
 
@@ -1101,15 +1559,26 @@ function count(n: number): string {
 host.onReady((ctx: HostReadyContext) => {
     applyHostReady(ctx, document.documentElement)
     surface = ctx.surface === "status" ? "status" : "panel"
-    if (!mounted) {
-        mounted = true
+    if (mounted) {
+        void refresh(false)
+        return
+    }
+    mounted = true
+    void (async () => {
+        await loadSettings()
+        range = settings.defaultRange
+        showEmptySessions = settings.showEmptySessions
         if (surface === "status") mountStatus()
         else mountPanel()
         startPolling()
-    }
-    void refresh()
+        await refresh(false)
+    })()
 })
 
 host.onSessionLifecycle(() => {
-    void refresh()
+    if (!mounted || view === "settings") return
+    void (async () => {
+        if (surface === "status") await loadSettings()
+        await refresh(false)
+    })()
 })

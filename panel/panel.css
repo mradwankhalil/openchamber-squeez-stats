@@ -31,6 +31,10 @@ html[data-oc-surface="panel"] body {
   --sq-accent: var(--success, #4cc38a);
   --sq-accent-text: var(--success-text, var(--success, currentColor));
   --sq-warn: var(--warning-text, var(--warning, #d6a24a));
+  /* the lightning icon's amber; used for the view and period buttons */
+  --sq-brand: #f2b705;
+  --sq-brand-soft: color-mix(in srgb, var(--sq-brand) 20%, transparent);
+  --sq-brand-line: color-mix(in srgb, var(--sq-brand) 60%, transparent);
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
@@ -81,17 +85,56 @@ html[data-oc-surface="panel"] body {
 }
 
 .sq-actions {
+  display: flex;
   flex: 0 0 auto;
+  gap: 4px;
 }
 
 .sq-tabs,
 .sq-range {
   flex: 0 0 auto;
-  padding: 6px 16px 0;
+  padding: 8px 16px 0;
 }
 
+.sq-tabs[hidden],
 .sq-range[hidden] {
   display: none;
+}
+
+/* View tabs (Overview, Sessions, Now, Storage) and period tabs: larger text,
+   amber selection. Scoped under .sq so the SDK's defaults stay untouched
+   elsewhere. */
+.sq .oc-sdk-tabs {
+  gap: 4px;
+  padding: 3px;
+  border-radius: 12px;
+  background: var(--sq-tile);
+}
+
+.sq .oc-sdk-tab {
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 9px;
+  color: var(--sq-muted);
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.sq .oc-sdk-tab:hover {
+  color: var(--surface-foreground, inherit);
+  background: color-mix(in srgb, var(--sq-brand) 9%, transparent);
+}
+
+.sq .oc-sdk-tab[aria-selected="true"] {
+  color: var(--surface-foreground, inherit);
+  background: var(--sq-brand-soft);
+  border-color: var(--sq-brand-line);
+}
+
+.sq-range .oc-sdk-tab {
+  height: 30px;
+  padding: 0 12px;
+  font-size: 0.95rem;
 }
 
 .sq-notice {
@@ -509,6 +552,71 @@ html[data-oc-surface="panel"] body {
 
 .sq-back {
   margin-top: 10px;
+}
+
+/* ---------- settings ---------- */
+
+.sq-setting {
+  margin-top: 12px;
+}
+
+.sq-setting-help {
+  margin-top: 4px;
+}
+
+.sq-setting-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 0 12px;
+}
+
+.sq-setting-grid .sq-setting {
+  margin-top: 8px;
+}
+
+.sq-setting-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.sq-checks {
+  margin-top: 12px;
+}
+
+.sq-list-text .sq-check-label,
+.sq-list-text .sq-check-path {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sq-check-label {
+  color: var(--sq-muted);
+  font-size: 0.9rem;
+}
+
+.sq-check-mark {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.sq-check-mark[data-state="ok"] {
+  background: color-mix(in srgb, var(--sq-accent) 18%, transparent);
+  color: var(--sq-accent-text);
+}
+
+.sq-check-mark[data-state="bad"] {
+  background: color-mix(in srgb, var(--error, #e5484d) 18%, transparent);
+  color: var(--error-text, var(--error, #e5484d));
+}
+
+.sq-check-mark[data-state="absent"] {
+  color: var(--sq-muted);
 }
 
 /* ---------- Work Status line ---------- */

@@ -1,9 +1,21 @@
 {
     "name": "openchamber-squeez-stats",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "private": true,
     "type": "module",
     "description": "OpenChamber extension: everything squeez records, counted from its own files",
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/mradwankhalil/openchamber-squeez-stats.git"
+    },
+    "homepage": "https://github.com/mradwankhalil/openchamber-squeez-stats#readme",
+    "keywords": [
+        "openchamber",
+        "openchamber-extension",
+        "squeez",
+        "tokens"
+    ],
     "openchamber": {
         "apiVersion": 1,
         "engines": {

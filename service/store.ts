@@ -1,7 +1,8 @@
 /**
  * squeez on-disk state: readers and a change-aware cache.
  *
- * Everything squeez persists under its home (default `~/.claude/squeez`):
+ * Everything squeez persists under its home (found automatically, see
+ * `discoverHomes`; Claude Code's `~/.claude/squeez` is squeez's default):
  *
  *  - `sessions/YYYY-MM-DD-HH.jsonl` event logs. One file per session-start
  *    hour (UTC), so sessions started in the same hour share a file. Events:
@@ -447,15 +448,165 @@ export function parseIni(text: string): Record<string, string> {
     return out
 }
 
-// -------------------------------------------------------------- home dir
+// -------------------------------------------------------------- locations
 
-export function resolveSqueezHome(): string {
-    const override = process.env.SQUEEZ_STATS_HOME
-    if (override && override.trim()) return path.resolve(override.trim())
-    return path.join(os.homedir(), ".claude", "squeez")
+/** Where every file the panel reads lives. */
+export interface SqueezPaths {
+    home: string
+    sessionsDir: string
+    summariesFile: string
+    blobsDir: string
+    configFile: string
+}
+
+/** User-chosen locations; an empty or missing field means "derive it". */
+export interface PathOverrides {
+    home?: string
+    sessions?: string
+    summaries?: string
+    blobs?: string
+    config?: string
+}
+
+export const PATH_OVERRIDE_KEYS = ["home", "sessions", "summaries", "blobs", "config"] as const
+
+/**
+ * Folders squeez keeps its state in, by host adapter (squeez `src/hosts/*`).
+ * Claude Code's is the default store; the others exist when squeez was set up
+ * only for that host.
+ */
+export const HOME_CANDIDATES: readonly (readonly string[])[] = [
+    [".claude", "squeez"],
+    [".copilot", "squeez"],
+    [".codex", "squeez"],
+    [".gemini", "squeez"],
+    [".hermes", "squeez"],
+    [".pi", "squeez"],
+    [".config", "opencode", "squeez"],
+]
+
+export interface HomeCandidate {
+    path: string
+    /** "env" when named by SQUEEZ_STATS_HOME or SQUEEZ_DIR, else "default" */
+    source: "env" | "default"
+    hasSessions: boolean
+    logFiles: number
+    /** newest event log's mtime, ms */
+    lastLog: number | null
 }
 
 const LOG_NAME = /^\d{4}-\d{2}-\d{2}-\d{2}\.jsonl$/
+
+async function inspectHome(dir: string, source: HomeCandidate["source"]): Promise<HomeCandidate> {
+    const sessions = path.join(dir, "sessions")
+    let names: string[] = []
+    let hasSessions = false
+    try {
+        hasSessions = (await fs.stat(sessions)).isDirectory()
+        if (hasSessions) names = (await fs.readdir(sessions)).filter((n) => LOG_NAME.test(n))
+    } catch {
+        // missing
+    }
+    // log names sort by hour, so the newest files are last
+    let lastLog: number | null = null
+    for (const name of names.sort().slice(-3)) {
+        try {
+            const m = (await fs.stat(path.join(sessions, name))).mtimeMs
+            if (lastLog === null || m > lastLog) lastLog = m
+        } catch {
+            // vanished
+        }
+    }
+    return { path: dir, source, hasSessions, logFiles: names.length, lastLog }
+}
+
+/** Every place squeez may keep its state on this machine, inspected. */
+export async function discoverHomes(
+    env: Record<string, string | undefined> = process.env,
+    userHome: string = os.homedir(),
+): Promise<HomeCandidate[]> {
+    const seen = new Set<string>()
+    const out: HomeCandidate[] = []
+    const add = async (dir: string, source: HomeCandidate["source"]) => {
+        const resolved = path.resolve(dir)
+        const key = process.platform === "win32" ? resolved.toLowerCase() : resolved
+        if (seen.has(key)) return
+        seen.add(key)
+        out.push(await inspectHome(resolved, source))
+    }
+    for (const name of ["SQUEEZ_STATS_HOME", "SQUEEZ_DIR"]) {
+        const value = env[name]?.trim()
+        if (value) await add(value, "env")
+    }
+    if (userHome) for (const parts of HOME_CANDIDATES) await add(path.join(userHome, ...parts), "default")
+    return out
+}
+
+/**
+ * The store to read when the user picked none: an environment override that
+ * exists, else the store with the most recent event log, else the first that
+ * has a sessions folder, else Claude Code's default location.
+ */
+export function pickHome(candidates: HomeCandidate[], userHome: string = os.homedir()): string {
+    const env = candidates.find((c) => c.source === "env" && c.hasSessions)
+    if (env) return env.path
+    const withLogs = candidates.filter((c) => c.lastLog !== null).sort((a, b) => (b.lastLog ?? 0) - (a.lastLog ?? 0))
+    if (withLogs[0]) return withLogs[0].path
+    const withSessions = candidates.find((c) => c.hasSessions)
+    if (withSessions) return withSessions.path
+    return path.join(userHome, ...(HOME_CANDIDATES[0] ?? [".claude", "squeez"]))
+}
+
+/** Overrides win field by field; the rest derive from the home folder. */
+export function resolvePaths(home: string, overrides: PathOverrides = {}): SqueezPaths {
+    const pick = (value: string | undefined, fallback: string) => (value && value.trim() ? path.resolve(value.trim()) : fallback)
+    const root = pick(overrides.home, path.resolve(home))
+    return {
+        home: root,
+        sessionsDir: pick(overrides.sessions, path.join(root, "sessions")),
+        summariesFile: pick(overrides.summaries, path.join(root, "memory", "summaries.jsonl")),
+        blobsDir: pick(overrides.blobs, path.join(root, "blobs")),
+        configFile: pick(overrides.config, path.join(root, "config.ini")),
+    }
+}
+
+/** Only absolute paths are accepted; anything else is dropped. */
+export function cleanOverrides(raw: Record<string, string | null | undefined>): PathOverrides {
+    const out: PathOverrides = {}
+    for (const key of PATH_OVERRIDE_KEYS) {
+        const value = raw[key]?.trim()
+        if (value && value.length <= 1024 && path.isAbsolute(value)) out[key] = value
+    }
+    return out
+}
+
+export interface LocationCheck {
+    id: (typeof PATH_OVERRIDE_KEYS)[number]
+    path: string
+    kind: "dir" | "file"
+    exists: boolean
+    /** the panel shows nothing without it (only the sessions folder) */
+    required: boolean
+}
+
+export async function checkPaths(paths: SqueezPaths): Promise<LocationCheck[]> {
+    const probe = async (p: string, kind: "dir" | "file") => {
+        try {
+            const st = await fs.stat(p)
+            return kind === "dir" ? st.isDirectory() : st.isFile()
+        } catch {
+            return false
+        }
+    }
+    const rows: [LocationCheck["id"], string, "dir" | "file", boolean][] = [
+        ["home", paths.home, "dir", false],
+        ["sessions", paths.sessionsDir, "dir", true],
+        ["summaries", paths.summariesFile, "file", false],
+        ["blobs", paths.blobsDir, "dir", false],
+        ["config", paths.configFile, "file", false],
+    ]
+    return Promise.all(rows.map(async ([id, p, kind, required]) => ({ id, path: p, kind, exists: await probe(p, kind), required })))
+}
 
 // ------------------------------------------------------------------ store
 
@@ -472,6 +623,7 @@ interface CachedLog extends Stamp, ParsedLog {}
  */
 export class SqueezStore {
     readonly home: string
+    readonly paths: SqueezPaths
     private readonly sessionsDir: string
     private logs = new Map<string, CachedLog>()
     private mergedEvents: SqueezEvent[] = []
@@ -479,9 +631,10 @@ export class SqueezStore {
     private summaries: { stamp: Stamp; records: SummaryRecord[]; unreadable: number } | null = null
     private blobs: { key: string; info: BlobStoreInfo } | null = null
 
-    constructor(home: string) {
-        this.home = home
-        this.sessionsDir = path.join(home, "sessions")
+    constructor(paths: SqueezPaths) {
+        this.paths = paths
+        this.home = paths.home
+        this.sessionsDir = paths.sessionsDir
     }
 
     async exists(): Promise<boolean> {
@@ -571,7 +724,7 @@ export class SqueezStore {
 
     /** Finished-session records, sorted by start. */
     async summaryRecords(): Promise<{ records: SummaryRecord[]; info: SummaryStoreInfo }> {
-        const file = path.join(this.home, "memory", "summaries.jsonl")
+        const file = this.paths.summariesFile
         const stamp = await this.stat(file)
         if (!stamp) {
             this.summaries = null
@@ -626,14 +779,14 @@ export class SqueezStore {
 
     async config(): Promise<Record<string, string>> {
         try {
-            return parseIni(await fs.readFile(path.join(this.home, "config.ini"), "utf8"))
+            return parseIni(await fs.readFile(this.paths.configFile, "utf8"))
         } catch {
             return {}
         }
     }
 
     async blobInfo(): Promise<BlobStoreInfo | null> {
-        const dir = path.join(this.home, "blobs")
+        const dir = this.paths.blobsDir
         let names: string[]
         let dirStamp: number
         try {

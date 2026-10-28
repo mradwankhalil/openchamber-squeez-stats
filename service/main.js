@@ -138,6 +138,34 @@ function dayLabel(ms) {
 function hourLabel(ms) {
   return `${pad(new Date(ms).getHours())}:00`;
 }
+var DEFAULT_LIMITS = {
+  topCommands: 12,
+  weakCommands: 8,
+  largestOutputs: 6,
+  toolsByName: 12,
+  errors: 8,
+  files: 10,
+  git: 10,
+  tests: 8,
+  recentCalls: 12,
+  repeatedErrors: 8,
+  fileEdits: 10,
+  repeatedCommands: 8
+};
+var LIMIT_MIN = 1;
+var LIMIT_MAX = 50;
+function normalizeLimits(raw) {
+  const out = { ...DEFAULT_LIMITS };
+  if (!raw || typeof raw !== "object")
+    return out;
+  const src = raw;
+  for (const key of Object.keys(DEFAULT_LIMITS)) {
+    const v = Number(src[key]);
+    if (Number.isFinite(v))
+      out[key] = Math.min(LIMIT_MAX, Math.max(LIMIT_MIN, Math.round(v)));
+  }
+  return out;
+}
 var MAX_DAY_BUCKETS = 400;
 var HOUR_SPAN_LIMIT = 48 * 3600000;
 function emptyTotals() {
@@ -167,8 +195,9 @@ function bump(map, text, ts) {
   } else
     map.set(key, { text: key, count: 1, last: ts });
 }
-function buildWindowReport(allEvents, sessionStarts, start, end) {
+function buildWindowReport(allEvents, sessionStarts, start, end, limits = DEFAULT_LIMITS) {
   const events = slice(allEvents, start, end);
+  const keepLargest = Math.max(10, limits.largestOutputs);
   const firstEvent = events[0]?.ts ?? null;
   const lastEvent = events[events.length - 1]?.ts ?? null;
   const shell = emptyTotals();
@@ -231,9 +260,9 @@ function buildWindowReport(allEvents, sessionStarts, start, end) {
         tests.push({ text: e.test.trim().slice(0, 200), ts: e.ts });
       if (e.inTk > 0) {
         largest.push({ cmd: e.cmd.slice(0, 240), inTokens: e.inTk, outTokens: e.outTk, ts: e.ts });
-        if (largest.length > 40) {
+        if (largest.length > keepLargest * 4) {
           largest.sort((a, b) => b.inTokens - a.inTokens);
-          largest.length = 10;
+          largest.length = keepLargest;
         }
       }
       hourOfDay[new Date(e.ts).getHours()].commands++;
@@ -270,14 +299,14 @@ function buildWindowReport(allEvents, sessionStarts, start, end) {
     granularity,
     series,
     hourOfDay,
-    topCommands: rows.filter((r) => r.savedTokens > 0).sort((a, b) => b.savedTokens - a.savedTokens).slice(0, 12),
-    weakCommands: rows.filter((r) => r.outTokens > 0 && r.savedTokens < r.inTokens * 0.1).sort((a, b) => b.outTokens - a.outTokens).slice(0, 8),
-    largestOutputs: largest.slice(0, 6),
-    toolsByName: [...toolMap.values()].sort((a, b) => b.tokens - a.tokens).slice(0, 12),
-    errors: topCounts(errors, 8),
-    files: topCounts(files, 10),
-    git: [...git.values()].sort((a, b) => b.last - a.last).slice(0, 10),
-    tests: tests.slice(-8).reverse()
+    topCommands: rows.filter((r) => r.savedTokens > 0).sort((a, b) => b.savedTokens - a.savedTokens).slice(0, limits.topCommands),
+    weakCommands: rows.filter((r) => r.outTokens > 0 && r.savedTokens < r.inTokens * 0.1).sort((a, b) => b.outTokens - a.outTokens).slice(0, limits.weakCommands),
+    largestOutputs: largest.slice(0, limits.largestOutputs),
+    toolsByName: [...toolMap.values()].sort((a, b) => b.tokens - a.tokens).slice(0, limits.toolsByName),
+    errors: topCounts(errors, limits.errors),
+    files: topCounts(files, limits.files),
+    git: [...git.values()].sort((a, b) => b.last - a.last).slice(0, limits.git),
+    tests: tests.slice(-limits.tests).reverse()
   };
 }
 function addTool(map, e) {
@@ -360,7 +389,7 @@ function sessionRow(allEvents, starts, i, byStart, current, now) {
     } : null
   };
 }
-function buildSessionDetail(allEvents, summaries, current, sessionStart, now) {
+function buildSessionDetail(allEvents, summaries, current, sessionStart, now, limits = DEFAULT_LIMITS) {
   const starts = sessionStarts(summaries, current);
   const i = starts.indexOf(sessionStart);
   if (i < 0)
@@ -372,7 +401,7 @@ function buildSessionDetail(allEvents, summaries, current, sessionStart, now) {
   return {
     row,
     summary: byStart.get(sessionStart) ?? null,
-    report: buildWindowReport(allEvents, starts, row.start, Math.max(row.end, row.start + 1))
+    report: buildWindowReport(allEvents, starts, row.start, Math.max(row.end, row.start + 1), limits)
   };
 }
 function handlerSummary(rows, max) {
@@ -393,15 +422,15 @@ function handlerSummary(rows, max) {
     outTokens
   };
 }
-function trimContext(ctx) {
+function trimContext(ctx, limits = DEFAULT_LIMITS) {
   if (!ctx)
     return null;
   return {
     ...ctx,
-    recentCalls: ctx.recentCalls.slice(0, 12),
-    repeatedErrors: ctx.repeatedErrors.slice(0, 8),
-    fileEdits: ctx.fileEdits.slice(0, 10),
-    repeatedCommands: ctx.repeatedCommands.slice(0, 8)
+    recentCalls: ctx.recentCalls.slice(0, limits.recentCalls),
+    repeatedErrors: ctx.repeatedErrors.slice(0, limits.repeatedErrors),
+    fileEdits: ctx.fileEdits.slice(0, limits.fileEdits),
+    repeatedCommands: ctx.repeatedCommands.slice(0, limits.repeatedCommands)
   };
 }
 
@@ -656,25 +685,121 @@ function parseIni(text) {
   }
   return out;
 }
-function resolveSqueezHome() {
-  const override = process.env.SQUEEZ_STATS_HOME;
-  if (override && override.trim())
-    return path.resolve(override.trim());
-  return path.join(os.homedir(), ".claude", "squeez");
-}
+var PATH_OVERRIDE_KEYS = ["home", "sessions", "summaries", "blobs", "config"];
+var HOME_CANDIDATES = [
+  [".claude", "squeez"],
+  [".copilot", "squeez"],
+  [".codex", "squeez"],
+  [".gemini", "squeez"],
+  [".hermes", "squeez"],
+  [".pi", "squeez"],
+  [".config", "opencode", "squeez"]
+];
 var LOG_NAME = /^\d{4}-\d{2}-\d{2}-\d{2}\.jsonl$/;
+async function inspectHome(dir, source) {
+  const sessions = path.join(dir, "sessions");
+  let names = [];
+  let hasSessions = false;
+  try {
+    hasSessions = (await fs.stat(sessions)).isDirectory();
+    if (hasSessions)
+      names = (await fs.readdir(sessions)).filter((n) => LOG_NAME.test(n));
+  } catch {}
+  let lastLog = null;
+  for (const name of names.sort().slice(-3)) {
+    try {
+      const m = (await fs.stat(path.join(sessions, name))).mtimeMs;
+      if (lastLog === null || m > lastLog)
+        lastLog = m;
+    } catch {}
+  }
+  return { path: dir, source, hasSessions, logFiles: names.length, lastLog };
+}
+async function discoverHomes(env = process.env, userHome = os.homedir()) {
+  const seen = new Set;
+  const out = [];
+  const add = async (dir, source) => {
+    const resolved = path.resolve(dir);
+    const key = process.platform === "win32" ? resolved.toLowerCase() : resolved;
+    if (seen.has(key))
+      return;
+    seen.add(key);
+    out.push(await inspectHome(resolved, source));
+  };
+  for (const name of ["SQUEEZ_STATS_HOME", "SQUEEZ_DIR"]) {
+    const value = env[name]?.trim();
+    if (value)
+      await add(value, "env");
+  }
+  if (userHome)
+    for (const parts of HOME_CANDIDATES)
+      await add(path.join(userHome, ...parts), "default");
+  return out;
+}
+function pickHome(candidates, userHome = os.homedir()) {
+  const env = candidates.find((c) => c.source === "env" && c.hasSessions);
+  if (env)
+    return env.path;
+  const withLogs = candidates.filter((c) => c.lastLog !== null).sort((a, b) => (b.lastLog ?? 0) - (a.lastLog ?? 0));
+  if (withLogs[0])
+    return withLogs[0].path;
+  const withSessions = candidates.find((c) => c.hasSessions);
+  if (withSessions)
+    return withSessions.path;
+  return path.join(userHome, ...HOME_CANDIDATES[0] ?? [".claude", "squeez"]);
+}
+function resolvePaths(home, overrides = {}) {
+  const pick = (value, fallback) => value && value.trim() ? path.resolve(value.trim()) : fallback;
+  const root = pick(overrides.home, path.resolve(home));
+  return {
+    home: root,
+    sessionsDir: pick(overrides.sessions, path.join(root, "sessions")),
+    summariesFile: pick(overrides.summaries, path.join(root, "memory", "summaries.jsonl")),
+    blobsDir: pick(overrides.blobs, path.join(root, "blobs")),
+    configFile: pick(overrides.config, path.join(root, "config.ini"))
+  };
+}
+function cleanOverrides(raw) {
+  const out = {};
+  for (const key of PATH_OVERRIDE_KEYS) {
+    const value = raw[key]?.trim();
+    if (value && value.length <= 1024 && path.isAbsolute(value))
+      out[key] = value;
+  }
+  return out;
+}
+async function checkPaths(paths) {
+  const probe = async (p, kind) => {
+    try {
+      const st = await fs.stat(p);
+      return kind === "dir" ? st.isDirectory() : st.isFile();
+    } catch {
+      return false;
+    }
+  };
+  const rows = [
+    ["home", paths.home, "dir", false],
+    ["sessions", paths.sessionsDir, "dir", true],
+    ["summaries", paths.summariesFile, "file", false],
+    ["blobs", paths.blobsDir, "dir", false],
+    ["config", paths.configFile, "file", false]
+  ];
+  return Promise.all(rows.map(async ([id, p, kind, required]) => ({ id, path: p, kind, exists: await probe(p, kind), required })));
+}
 
 class SqueezStore {
   home;
+  paths;
   sessionsDir;
   logs = new Map;
   mergedEvents = [];
   mergedKey = "";
   summaries = null;
   blobs = null;
-  constructor(home) {
-    this.home = home;
-    this.sessionsDir = path.join(home, "sessions");
+  constructor(paths) {
+    this.paths = paths;
+    this.home = paths.home;
+    this.sessionsDir = paths.sessionsDir;
   }
   async exists() {
     try {
@@ -760,7 +885,7 @@ class SqueezStore {
     };
   }
   async summaryRecords() {
-    const file = path.join(this.home, "memory", "summaries.jsonl");
+    const file = this.paths.summariesFile;
     const stamp = await this.stat(file);
     if (!stamp) {
       this.summaries = null;
@@ -815,13 +940,13 @@ class SqueezStore {
   }
   async config() {
     try {
-      return parseIni(await fs.readFile(path.join(this.home, "config.ini"), "utf8"));
+      return parseIni(await fs.readFile(this.paths.configFile, "utf8"));
     } catch {
       return {};
     }
   }
   async blobInfo() {
-    const dir = path.join(this.home, "blobs");
+    const dir = this.paths.blobsDir;
     let names;
     let dirStamp;
     try {
@@ -876,7 +1001,54 @@ if (!Number.isInteger(port) || port <= 0 || !token) {
   console.error("[squeez-stats] OPENCHAMBER_SERVICE_PORT and OPENCHAMBER_SERVICE_TOKEN are required");
   process.exit(1);
 }
-var store = new SqueezStore(resolveSqueezHome());
+var DISCOVERY_TTL_MS = 30000;
+var discovery = null;
+async function candidates() {
+  if (!discovery || Date.now() - discovery.at > DISCOVERY_TTL_MS) {
+    discovery = { at: Date.now(), candidates: await discoverHomes() };
+  }
+  return discovery.candidates;
+}
+var MAX_STORES = 6;
+var stores = new Map;
+function overridesFrom(url) {
+  const raw = {};
+  for (const key of PATH_OVERRIDE_KEYS)
+    raw[key] = url.searchParams.get(key);
+  return cleanOverrides(raw);
+}
+function limitsFrom(url) {
+  const raw = url.searchParams.get("limits");
+  if (!raw || raw.length > 2000)
+    return normalizeLimits(null);
+  try {
+    return normalizeLimits(JSON.parse(raw));
+  } catch {
+    return normalizeLimits(null);
+  }
+}
+async function contextFor(url) {
+  const overrides = overridesFrom(url);
+  const pathSource = overrides.home ? "settings" : "auto";
+  const home = overrides.home ?? pickHome(await candidates());
+  const paths = resolvePaths(home, overrides);
+  const key = JSON.stringify(paths);
+  let store = stores.get(key);
+  if (!store) {
+    store = new SqueezStore(paths);
+    stores.set(key, store);
+    while (stores.size > MAX_STORES) {
+      const oldest = stores.keys().next().value;
+      if (oldest === undefined)
+        break;
+      stores.delete(oldest);
+    }
+  } else {
+    stores.delete(key);
+    stores.set(key, store);
+  }
+  return { store, pathSource, limits: limitsFrom(url) };
+}
 function sendJson(res, status, body) {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
@@ -891,55 +1063,62 @@ function msParam(url, name, fallback) {
     return fallback;
   return Number(raw);
 }
-async function meta() {
+async function meta(ctx) {
+  const { store } = ctx;
   const available = await store.exists();
   const events = available ? await store.events() : [];
   return {
     home: store.home,
+    paths: store.paths,
+    pathSource: ctx.pathSource,
     available,
     generatedAt: Date.now(),
     firstEvent: events[0]?.ts ?? null,
     lastEvent: events[events.length - 1]?.ts ?? null
   };
 }
-async function starts() {
+async function starts(store) {
   const [{ records }, current] = await Promise.all([store.summaryRecords(), store.current()]);
   return sessionStarts(records, current);
 }
 var routes = {
-  "/status": async (url) => {
+  "/status": async (url, ctx) => {
     const now = Date.now();
-    const report = buildWindowReport(await store.events(), [], msParam(url, "start", 0), msParam(url, "end", now + 1));
-    return { meta: await meta(), shell: report.shell, tools: report.tools };
+    const report = buildWindowReport(await ctx.store.events(), [], msParam(url, "start", 0), msParam(url, "end", now + 1), ctx.limits);
+    return { meta: await meta(ctx), shell: report.shell, tools: report.tools };
   },
-  "/overview": async (url) => {
+  "/overview": async (url, ctx) => {
     const now = Date.now();
-    const report = buildWindowReport(await store.events(), await starts(), msParam(url, "start", 0), msParam(url, "end", now + 1));
-    return { meta: await meta(), report };
+    const report = buildWindowReport(await ctx.store.events(), await starts(ctx.store), msParam(url, "start", 0), msParam(url, "end", now + 1), ctx.limits);
+    return { meta: await meta(ctx), report };
   },
-  "/sessions": async (url) => {
+  "/sessions": async (url, ctx) => {
     const now = Date.now();
+    const { store } = ctx;
     const [{ records }, current] = await Promise.all([store.summaryRecords(), store.current()]);
     const result = buildSessions(await store.events(), records, current, msParam(url, "start", 0), msParam(url, "end", now + 1), now);
-    return { meta: await meta(), ...result };
+    return { meta: await meta(ctx), ...result };
   },
-  "/session": async (url) => {
+  "/session": async (url, ctx) => {
+    const { store } = ctx;
     const [{ records }, current] = await Promise.all([store.summaryRecords(), store.current()]);
-    const detail = buildSessionDetail(await store.events(), records, current, msParam(url, "start", -1), Date.now());
-    return { meta: await meta(), ...detail };
+    const detail = buildSessionDetail(await store.events(), records, current, msParam(url, "start", -1), Date.now(), ctx.limits);
+    return { meta: await meta(ctx), ...detail };
   },
-  "/now": async () => {
+  "/now": async (_url, ctx) => {
+    const { store } = ctx;
     const [current, context, events] = await Promise.all([store.current(), store.context(), store.events()]);
-    const report = current ? buildWindowReport(events, await starts(), current.start, Date.now() + 1) : null;
+    const report = current ? buildWindowReport(events, await starts(store), current.start, Date.now() + 1, ctx.limits) : null;
     return {
-      meta: await meta(),
+      meta: await meta(ctx),
       current,
-      context: trimContext(context),
+      context: trimContext(context, ctx.limits),
       contextMatches: !!current && !!context && context.sessionFile === current.sessionFile,
       report
     };
   },
-  "/storage": async () => {
+  "/storage": async (_url, ctx) => {
+    const { store } = ctx;
     const [logs, summaries, blobs, handlers, config] = await Promise.all([
       store.logInfo(),
       store.summaryRecords(),
@@ -948,12 +1127,22 @@ var routes = {
       store.config()
     ]);
     return {
-      meta: await meta(),
+      meta: await meta(ctx),
       logs,
       summaries: summaries.info,
       blobs,
       handlers: handlerSummary(handlers, HANDLER_TABLE_MAX),
       config: Object.entries(config).map(([key, value]) => ({ key, value }))
+    };
+  },
+  "/locations": async (url, ctx) => {
+    if (url.searchParams.get("rescan") === "1")
+      discovery = null;
+    return {
+      paths: ctx.store.paths,
+      pathSource: ctx.pathSource,
+      checks: await checkPaths(ctx.store.paths),
+      candidates: await candidates()
     };
   }
 };
@@ -973,7 +1162,7 @@ var server = http.createServer(async (req, res) => {
       sendJson(res, 404, { error: "not found" });
       return;
     }
-    sendJson(res, 200, await route(url));
+    sendJson(res, 200, await route(url, await contextFor(url)));
   } catch (error) {
     sendJson(res, 500, {
       error: error instanceof Error ? error.message : String(error)
@@ -981,5 +1170,5 @@ var server = http.createServer(async (req, res) => {
   }
 });
 server.listen(port, "127.0.0.1", () => {
-  console.log(`[squeez-stats] listening on 127.0.0.1:${port} (home: ${store.home})`);
+  console.log(`[squeez-stats] listening on 127.0.0.1:${port}`);
 });

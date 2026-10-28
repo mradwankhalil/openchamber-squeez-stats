@@ -122,9 +122,20 @@ await fs.writeFile(path.join(home, "config.ini"), "# squeez\nenabled = true\nmem
 const port = await freePort()
 const token = "smoke-token"
 
+// an empty user profile, so discovery never finds this machine's real squeez
+const fakeUser = await fs.mkdtemp(path.join(os.tmpdir(), "sq-stats-user-"))
+
 function startService(squeezHome) {
     const child = spawn(process.execPath, [serviceEntry], {
-        env: { ...process.env, OPENCHAMBER_SERVICE_PORT: String(port), OPENCHAMBER_SERVICE_TOKEN: token, SQUEEZ_STATS_HOME: squeezHome },
+        env: {
+            ...process.env,
+            HOME: fakeUser,
+            USERPROFILE: fakeUser,
+            SQUEEZ_DIR: "",
+            OPENCHAMBER_SERVICE_PORT: String(port),
+            OPENCHAMBER_SERVICE_TOKEN: token,
+            SQUEEZ_STATS_HOME: squeezHome,
+        },
         stdio: ["ignore", "pipe", "pipe"],
     })
     let stderr = ""
@@ -225,6 +236,36 @@ try {
     assert.equal(storage.handlers.max, 64)
     assert.deepEqual(storage.config.find((c) => c.key === "memory_retention_days"), { key: "memory_retention_days", value: "30" })
 
+    // list lengths come from the query
+    const limited = await get(`/overview?start=0&limits=${encodeURIComponent(JSON.stringify({ toolsByName: 1 }))}`)
+    assert.equal(limited.report.toolsByName.length, 1)
+    assert.ok(overview.report.toolsByName.length > 1)
+
+    // /locations reports what is read and whether it exists
+    const loc = await get("/locations")
+    assert.equal(loc.pathSource, "auto")
+    assert.equal(loc.paths.home, home)
+    assert.deepEqual(
+        loc.checks.map((c) => [c.id, c.exists]),
+        [["home", true], ["sessions", true], ["summaries", true], ["blobs", true], ["config", true]],
+    )
+    assert.ok(loc.candidates.some((c) => c.path === home && c.source === "env"))
+    assert.equal(overview.meta.paths.sessionsDir, sessions)
+
+    // locations chosen in the panel's settings override discovery
+    const moved = path.join(home, "moved-logs")
+    await fs.mkdir(moved)
+    await fs.copyFile(path.join(sessions, "2026-10-15-01.jsonl"), path.join(moved, "2026-10-15-01.jsonl"))
+    const viaQuery = await get(`/status?start=0&sessions=${encodeURIComponent(moved)}`)
+    assert.equal(viaQuery.meta.pathSource, "auto", "home still discovered")
+    assert.equal(viaQuery.meta.paths.sessionsDir, moved)
+    assert.equal(viaQuery.shell.commands, 1, "only the moved log is read")
+    const chosen = await get(`/locations?home=${encodeURIComponent(path.join(home, "nope"))}`)
+    assert.equal(chosen.pathSource, "settings")
+    assert.equal(chosen.checks.find((c) => c.id === "sessions").exists, false)
+    const relative = await get(`/locations?home=relative/dir`)
+    assert.equal(relative.pathSource, "auto", "relative paths are ignored")
+
     // appending to the live log is picked up on the next request (cache invalidation)
     await fs.appendFile(path.join(sessions, "2026-10-15-01.jsonl"), bash(s3 + 30, "git diff", 100, 10) + "\n")
     const after = await get(`/status?start=${(nowSec - 3600) * 1000}`)
@@ -239,8 +280,11 @@ try {
     assert.equal(missing.meta.available, false)
     assert.equal(missing.report.shell.commands, 0)
 
-    console.log("smoke ok: auth, 404, /status, /overview, /sessions, /session, /now, /storage, merged-line recovery, cache refresh, missing home")
+    console.log(
+        "smoke ok: auth, 404, /status, /overview, /sessions, /session, /now, /storage, /locations, path overrides, list limits, merged-line recovery, cache refresh, missing home",
+    )
 } finally {
     svc.child.kill("SIGTERM")
     await fs.rm(home, { recursive: true, force: true })
+    await fs.rm(fakeUser, { recursive: true, force: true })
 }

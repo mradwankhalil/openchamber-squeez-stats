@@ -17,9 +17,12 @@ import type {
     ContextState,
     CurrentSession,
     HandlerRow,
+    HomeCandidate,
+    LocationCheck,
     LogStoreInfo,
     ShellEvent,
     SqueezEvent,
+    SqueezPaths,
     SummaryRecord,
     SummaryStoreInfo,
     ToolEvent,
@@ -29,10 +32,22 @@ import type {
 
 export interface Meta {
     home: string
+    /** every location read, after discovery and the user's overrides */
+    paths: SqueezPaths
+    /** "settings" when the user chose the squeez folder, else "auto" */
+    pathSource: "settings" | "auto"
     available: boolean
     generatedAt: number
     firstEvent: number | null
     lastEvent: number | null
+}
+
+/** `/locations`: what discovery found and whether each file exists. */
+export interface LocationsPayload {
+    paths: SqueezPaths
+    pathSource: "settings" | "auto"
+    checks: LocationCheck[]
+    candidates: HomeCandidate[]
 }
 
 export interface ShellTotals {
@@ -326,6 +341,52 @@ function hourLabel(ms: number): string {
     return `${pad(new Date(ms).getHours())}:00`
 }
 
+/** How many rows each list returns. The panel's settings choose these. */
+export interface ListLimits {
+    topCommands: number
+    weakCommands: number
+    largestOutputs: number
+    toolsByName: number
+    errors: number
+    files: number
+    git: number
+    tests: number
+    recentCalls: number
+    repeatedErrors: number
+    fileEdits: number
+    repeatedCommands: number
+}
+
+export const DEFAULT_LIMITS: ListLimits = {
+    topCommands: 12,
+    weakCommands: 8,
+    largestOutputs: 6,
+    toolsByName: 12,
+    errors: 8,
+    files: 10,
+    git: 10,
+    tests: 8,
+    recentCalls: 12,
+    repeatedErrors: 8,
+    fileEdits: 10,
+    repeatedCommands: 8,
+}
+
+export const LIMIT_MIN = 1
+export const LIMIT_MAX = 50
+
+/** Untrusted input to limits: known keys, whole numbers, clamped; the rest default. */
+export function normalizeLimits(raw: unknown): ListLimits {
+    const out: ListLimits = { ...DEFAULT_LIMITS }
+    if (!raw || typeof raw !== "object") return out
+    const src = raw as Record<string, unknown>
+    for (const key of Object.keys(DEFAULT_LIMITS) as (keyof ListLimits)[]) {
+        const v = Number(src[key])
+        if (Number.isFinite(v)) out[key] = Math.min(LIMIT_MAX, Math.max(LIMIT_MIN, Math.round(v)))
+    }
+    return out
+}
+
 const MAX_DAY_BUCKETS = 400
 const HOUR_SPAN_LIMIT = 48 * 3_600_000
 
@@ -363,8 +424,10 @@ export function buildWindowReport(
     sessionStarts: number[],
     start: number,
     end: number,
+    limits: ListLimits = DEFAULT_LIMITS,
 ): WindowReport {
     const events = slice(allEvents, start, end)
+    const keepLargest = Math.max(10, limits.largestOutputs)
     const firstEvent = events[0]?.ts ?? null
     const lastEvent = events[events.length - 1]?.ts ?? null
 
@@ -426,9 +489,9 @@ export function buildWindowReport(
             if (e.test.trim()) tests.push({ text: e.test.trim().slice(0, 200), ts: e.ts })
             if (e.inTk > 0) {
                 largest.push({ cmd: e.cmd.slice(0, 240), inTokens: e.inTk, outTokens: e.outTk, ts: e.ts })
-                if (largest.length > 40) {
+                if (largest.length > keepLargest * 4) {
                     largest.sort((a, b) => b.inTokens - a.inTokens)
-                    largest.length = 10
+                    largest.length = keepLargest
                 }
             }
             hourOfDay[new Date(e.ts).getHours()]!.commands++
@@ -469,17 +532,17 @@ export function buildWindowReport(
         topCommands: rows
             .filter((r) => r.savedTokens > 0)
             .sort((a, b) => b.savedTokens - a.savedTokens)
-            .slice(0, 12),
+            .slice(0, limits.topCommands),
         weakCommands: rows
             .filter((r) => r.outTokens > 0 && r.savedTokens < r.inTokens * 0.1)
             .sort((a, b) => b.outTokens - a.outTokens)
-            .slice(0, 8),
-        largestOutputs: largest.slice(0, 6),
-        toolsByName: [...toolMap.values()].sort((a, b) => b.tokens - a.tokens).slice(0, 12),
-        errors: topCounts(errors, 8),
-        files: topCounts(files, 10),
-        git: [...git.values()].sort((a, b) => b.last - a.last).slice(0, 10),
-        tests: tests.slice(-8).reverse(),
+            .slice(0, limits.weakCommands),
+        largestOutputs: largest.slice(0, limits.largestOutputs),
+        toolsByName: [...toolMap.values()].sort((a, b) => b.tokens - a.tokens).slice(0, limits.toolsByName),
+        errors: topCounts(errors, limits.errors),
+        files: topCounts(files, limits.files),
+        git: [...git.values()].sort((a, b) => b.last - a.last).slice(0, limits.git),
+        tests: tests.slice(-limits.tests).reverse(),
     }
 }
 
@@ -593,6 +656,7 @@ export function buildSessionDetail(
     current: CurrentSession | null,
     sessionStart: number,
     now: number,
+    limits: ListLimits = DEFAULT_LIMITS,
 ): { row: SessionRow | null; summary: SummaryRecord | null; report: WindowReport | null } {
     const starts = sessionStarts(summaries, current)
     const i = starts.indexOf(sessionStart)
@@ -603,7 +667,7 @@ export function buildSessionDetail(
     return {
         row,
         summary: byStart.get(sessionStart) ?? null,
-        report: buildWindowReport(allEvents, starts, row.start, Math.max(row.end, row.start + 1)),
+        report: buildWindowReport(allEvents, starts, row.start, Math.max(row.end, row.start + 1), limits),
     }
 }
 
@@ -629,13 +693,13 @@ export function handlerSummary(rows: HandlerRow[], max: number): StoragePayload[
 }
 
 /** Trim the context lists to what the panel shows. */
-export function trimContext(ctx: ContextState | null): ContextState | null {
+export function trimContext(ctx: ContextState | null, limits: ListLimits = DEFAULT_LIMITS): ContextState | null {
     if (!ctx) return null
     return {
         ...ctx,
-        recentCalls: ctx.recentCalls.slice(0, 12),
-        repeatedErrors: ctx.repeatedErrors.slice(0, 8),
-        fileEdits: ctx.fileEdits.slice(0, 10),
-        repeatedCommands: ctx.repeatedCommands.slice(0, 8),
+        recentCalls: ctx.recentCalls.slice(0, limits.recentCalls),
+        repeatedErrors: ctx.repeatedErrors.slice(0, limits.repeatedErrors),
+        fileEdits: ctx.fileEdits.slice(0, limits.fileEdits),
+        repeatedCommands: ctx.repeatedCommands.slice(0, limits.repeatedCommands),
     }
 }
