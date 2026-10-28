@@ -1,5 +1,28 @@
+# dependencies
 node_modules/
-*.log
-.DS_Store
+
+# local tool state (code index, agent workspaces and reports)
+.codegraph/
 .omo/
+.claude/
+.opencode/
+sub-agents-reports/
+
+# editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# logs, scratch and test output
+*.log
 *.tmp.*
+*.tmp
+coverage/
+
+# local environment and packed builds
+.env
+.env.*
+*.tgz
+*.zip

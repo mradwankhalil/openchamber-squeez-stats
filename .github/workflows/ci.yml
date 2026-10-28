@@ -1,0 +1,59 @@
+name: CI
+
+# Guards what OpenChamber users receive. A git-installed extension is offered
+# "Update" only when package.json `version` goes up, and OpenChamber serves
+# the committed bundles as they are, so every push to main must:
+#   1. carry bundles that match a fresh build of the sources,
+#   2. pass typecheck, unit tests and the service smoke test,
+#   3. bump `version` whenever a change reaches users.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Bundles match the sources
+        run: |
+          bun run build
+          if ! git diff --exit-code --stat -- panel/main.js service/main.js; then
+            echo "::error::panel/main.js or service/main.js is stale. Run 'bun run build' and commit the bundles."
+            exit 1
+          fi
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Unit tests
+        run: bun test
+
+      - name: Service smoke test
+        run: node scripts/smoke.mjs
+
+      - name: Version bumped for shipped changes
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: node scripts/check-release.mjs "$BASE"

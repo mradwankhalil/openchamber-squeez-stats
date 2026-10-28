@@ -45,7 +45,10 @@
         "build:service": "bunx openchamber-guest-bundle --node service/main.ts service/main.js",
         "typecheck": "tsc --noEmit && tsc --noEmit -p tests",
         "test": "bun test",
-        "smoke": "node scripts/smoke.mjs"
+        "smoke": "node scripts/smoke.mjs",
+        "verify": "bun run build && bun run typecheck && bun test && node scripts/smoke.mjs",
+        "release": "node scripts/release.mjs",
+        "check:release": "node scripts/check-release.mjs"
     },
     "dependencies": {
         "@openchamber/sdk": "^2.1.0"
