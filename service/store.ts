@@ -473,7 +473,8 @@ export const PATH_OVERRIDE_KEYS = ["home", "sessions", "summaries", "blobs", "co
 /**
  * Folders squeez keeps its state in, by host adapter (squeez `src/hosts/*`).
  * Claude Code's is the default store; the others exist when squeez was set up
- * only for that host.
+ * only for that host. The OpenCode plugin keeps its state under
+ * `$XDG_STATE_HOME/squeez/opencode`, checked as well when that variable is set.
  */
 export const HOME_CANDIDATES: readonly (readonly string[])[] = [
     [".claude", "squeez"],
@@ -483,6 +484,8 @@ export const HOME_CANDIDATES: readonly (readonly string[])[] = [
     [".hermes", "squeez"],
     [".pi", "squeez"],
     [".config", "opencode", "squeez"],
+    // OpenCode plugin default: $XDG_STATE_HOME/squeez/opencode
+    [".local", "state", "squeez", "opencode"],
 ]
 
 export interface HomeCandidate {
@@ -539,6 +542,8 @@ export async function discoverHomes(
         if (value) await add(value, "env")
     }
     if (userHome) for (const parts of HOME_CANDIDATES) await add(path.join(userHome, ...parts), "default")
+    const xdgState = env.XDG_STATE_HOME?.trim()
+    if (xdgState) await add(path.join(xdgState, "squeez", "opencode"), "default")
     return out
 }
 
