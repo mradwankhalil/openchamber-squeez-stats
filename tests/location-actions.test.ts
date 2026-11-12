@@ -2,10 +2,12 @@ import { expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 import vm from "node:vm"
 import ts from "typescript"
+import { createRefreshScheduler } from "../panel/recovery"
+import type { RefreshRequest, RunOutcome } from "../panel/recovery"
 
 const source = readFileSync(new URL("../panel/main.ts", import.meta.url), "utf8")
 const parsed = ts.createSourceFile("panel/main.ts", source, ts.ScriptTarget.Latest, true)
-const names = new Set(["serviceQuery", "currentRequest", "applySettingsChange", "checkDraftLocations", "renderLocationSettings", "renderPanel", "refresh"])
+const names = new Set(["serviceQuery", "currentRequest", "applySettingsChange", "checkDraftLocations", "renderLocationSettings", "renderPanel", "refresh", "fetchCurrent", "failureFrom", "requestKey"])
 const declarations = parsed.statements.filter((node) => ts.isFunctionDeclaration(node) && node.name && names.has(node.name.text))
 if (declarations.length !== names.size) throw new Error("Production location functions not found")
 const compiled = ts.transpileModule(declarations.map((node) => node.getText(parsed)).join("\n"), {
@@ -45,7 +47,15 @@ function locations(home: string) {
         settingsProblem: null, lastRenderedKey: "", lastRequestKey: "", lastPayload: saved,
         lastPayloadKey: "", lastRefreshedAt: 123, notice: null, fetchSeq: 0, draftCheckSeq: 0,
         refs: { body: element(), subtitle: { textContent: "" }, lastRefreshed: { textContent: "" }, refresh: { update() {} } },
-        saveSettings: async () => { saves++ }, schedulePoll() {}, describeError: () => ({ title: "Service unavailable" }),
+        saveSettings: async () => { saves++ }, describeError: () => ({ title: "Service unavailable" }),
+        lastRefreshedKey: "", failure: null, loadSettings: async () => {}, recordFailure: async () => {}, noteRecovered() {},
+        HostRequestError: class extends Error { code = "" }, Date, JSON,
+        // the production scheduler; its timers never fire in these tests
+        scheduler: createRefreshScheduler({
+            run: (job) => api.fetchCurrent(job),
+            autoRefresh: () => true, intervalMs: () => 60_000, isVisible: () => true, canRunAutomatically: () => false,
+            setTimer: () => 0, clearTimer() {}, now: () => 0,
+        }),
         host: { serviceRequest: async (request: { query: Record<string, string> }) => {
             requests.push(request.query)
             const resolved = request.query.home || "/automatic"
@@ -67,7 +77,8 @@ function locations(home: string) {
         },
         render: () => api.renderPanel(false),
     }
-    const api = vm.runInNewContext(`${compiled}\n({ currentRequest, renderPanel, renderLocationSettings })`, context) as {
+    const api = vm.runInNewContext(`${compiled}\n({ currentRequest, renderPanel, renderLocationSettings, fetchCurrent })`, context) as {
+        fetchCurrent: (job: RefreshRequest) => Promise<RunOutcome>
         currentRequest: () => { path: string; query: Record<string, string> }
         renderPanel: (force: boolean) => void
         renderLocationSettings: (node: Node, data: unknown) => void

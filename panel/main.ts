@@ -22,6 +22,8 @@ import { applyHostReady, mountBanner, mountButton, mountSelect, mountSwitch, mou
 import type { BannerHandle, ButtonHandle, TabsHandle } from "@openchamber/sdk/ui"
 import { DEFAULT_LIMITS, LIMIT_MAX, LIMIT_MIN } from "../service/report"
 import { formatRefreshedAt, initializeSurface } from "./startup"
+import { createRefreshScheduler, diagnoseFailure } from "./recovery"
+import type { FailureKind, RefreshRequest, RunOutcome } from "./recovery"
 import type {
     CommandRow,
     CountRow,
@@ -170,6 +172,37 @@ type Notice = {
     body?: string
 }
 
+/** The last failed data request; cleared by the next success. */
+type Failure = {
+    notice: Notice
+    code: string | null
+    httpStatus?: number
+    at: number
+    elapsedMs: number
+    path: string
+    diagnosis: { kind: FailureKind; summary: string } | null
+}
+
+/** One failed attempt, as kept in host storage. No paths, queries or service output. */
+type FailureRecord = {
+    at: number
+    code: string | null
+    httpStatus?: number
+    elapsedMs: number
+    serviceStatus: string | null
+    kind: FailureKind
+    summary: string
+}
+
+/** A run of failures on one surface until the next success. */
+type ConnectionEpisode = {
+    surface: "panel" | "status"
+    path: string
+    startedAt: number
+    failures: FailureRecord[]
+    recoveredAt: number | null
+}
+
 let mounted = false
 let initialized = false
 let surface: "panel" | "status" = "panel"
@@ -179,7 +212,6 @@ let metric: Metric = "saved"
 let detailStart: number | null = null
 let showEmptySessions = false
 let notice: Notice | null = null
-let pollTimer: number | null = null
 let fetchSeq = 0
 let lastStatusHeight = -1
 /** last rendered payload per request key, minus `generatedAt` */
@@ -190,6 +222,9 @@ let lastPayload: unknown = null
 /** Only reuse data for the endpoint, period and file locations that produced it. */
 let lastPayloadKey = ""
 let lastRefreshedAt: number | null = null
+/** the request whose successful answer `lastRefreshedAt` dates */
+let lastRefreshedKey = ""
+let failure: Failure | null = null
 /** locations typed in Settings but not saved yet */
 let draftPaths: Record<PathKey, string> = { home: "", sessions: "", summaries: "", blobs: "", config: "" }
 /** a /locations answer for the draft, from "Check" */
@@ -916,7 +951,7 @@ function settingRow(container: HTMLElement, help?: string): HTMLElement {
 
 function applySettingsChange(options: { reschedule?: boolean; refetch?: boolean } = {}): void {
     void saveSettings().then(() => {
-        if (options.reschedule) schedulePoll()
+        if (options.reschedule) scheduler.reschedule()
         if (settingsProblem) renderPanel(true)
     })
     if (options.refetch) lastRenderedKey = ""
@@ -932,6 +967,9 @@ function openSettings(): void {
     refs?.body.replaceChildren(el("p", "sq-explain", "Loading…"))
     syncChrome()
     void refresh(true)
+    void loadConnectionHistory().then(() => {
+        if (view === "settings") renderPanel(true)
+    })
 }
 
 function closeSettings(): void {
@@ -1051,6 +1089,7 @@ function renderSettings(container: HTMLElement, saved: LocationsPayload): void {
     container.appendChild(lists.root)
 
     renderLocationSettings(container, saved)
+    renderConnectionSettings(container)
 
     const reset = section("Reset")
     mountButton(settingRow(reset.body, "Back to the defaults: refresh every minute, 30 days, default list lengths, locations found automatically."), {
@@ -1069,6 +1108,32 @@ function renderSettings(container: HTMLElement, saved: LocationsPayload): void {
         },
     })
     container.appendChild(reset.root)
+}
+
+/** Recorded problems reaching the service, newest first: what failed, and whether it recovered. */
+function renderConnectionSettings(container: HTMLElement): void {
+    const s = section(
+        "Connection to the stats service",
+        "Problems reaching the local service, kept so a slow or failed start can be explained later. Only times, error codes and the service state are kept.",
+    )
+    if (connectionHistory.length === 0) {
+        s.body.appendChild(note("No connection problems recorded."))
+    } else {
+        s.body.appendChild(
+            textList(
+                connectionHistory.slice(0, 3).map((e) => {
+                    const last = e.failures[e.failures.length - 1]
+                    const where = e.surface === "status" ? "Work Status line" : "panel"
+                    return {
+                        text: `${formatClock(e.startedAt)}, ${where}: ${last?.summary ?? "request failed"}`,
+                        meta: `${plural(e.failures.length, "failed attempt")} · ${e.recoveredAt ? `recovered after ${formatDuration(e.recoveredAt - e.startedAt)}` : "not recovered"}`,
+                    }
+                }),
+                false,
+            ),
+        )
+    }
+    container.appendChild(s.root)
 }
 
 function renderLocationSettings(container: HTMLElement, saved: LocationsPayload): void {
@@ -1328,38 +1393,186 @@ function currentRequest(): { path: string; query: Record<string, string> } {
     return { path: `/${view}`, query: serviceQuery({}) }
 }
 
+function requestKey(request: { path: string; query: Record<string, string> }): string {
+    return `${request.path}?${JSON.stringify(request.query)}`
+}
+
+/** Every refresh goes through the scheduler: one request at a time, bounded recovery. */
+const scheduler = createRefreshScheduler({
+    run: (job) => fetchCurrent(job),
+    autoRefresh: () => settings.autoRefresh,
+    intervalMs: () => settings.refreshSeconds * 1000,
+    isVisible: () => document.visibilityState === "visible",
+    canRunAutomatically: () => document.visibilityState === "visible" && view !== "settings",
+    setTimer: (fn, ms) => window.setTimeout(fn, ms),
+    clearTimer: (handle) => window.clearTimeout(handle as number),
+    now: () => Date.now(),
+    onChange: () => render(),
+})
+
+/** A refresh the user asked for: a click, navigation or a settings change. */
+function refresh(manual = false, rescan = false): Promise<void> {
+    return scheduler.trigger("user", { manual, rescan })
+}
+
 /**
- * Fetch the current view. `manual` (a click) shows the spinner on Refresh;
- * background refreshes never do, so the header stays still.
+ * Fetch the current view once. `manual` (a click) shows the spinner on
+ * Refresh; background refreshes never do, so the header stays still. An
+ * answer for a request that is no longer current is dropped as superseded.
  */
-async function refresh(manual = false, rescan = false): Promise<void> {
+async function fetchCurrent(job: RefreshRequest): Promise<RunOutcome> {
+    // the status line has no settings form; pick up changes made in the panel
+    if (surface === "status" && job.source !== "user" && job.source !== "startup") await loadSettings()
     const seq = ++fetchSeq
     const request = currentRequest()
-    if (manual) refs?.refresh.update({ loading: true })
+    const key = requestKey(request)
+    const startedAt = Date.now()
+    const isCurrent = () => seq === fetchSeq && key === requestKey(currentRequest())
+    let outcome: RunOutcome = { kind: "superseded" }
+    if (job.manual) refs?.refresh.update({ loading: true })
     try {
         // Rescanning bypasses discovery's cache, but does not change data identity.
-        const query = rescan ? { ...request.query, rescan: "1" } : request.query
+        const query = job.rescan ? { ...request.query, rescan: "1" } : request.query
         const result = await host.serviceRequest({ method: "GET", path: request.path, query })
-        if (seq !== fetchSeq) return
+        if (!isCurrent()) return outcome
         if (result.status !== 200) {
-            throw new Error(`stats service responded with HTTP ${result.status}`)
+            outcome = { kind: "failed", code: null, httpStatus: result.status }
+            failure = failureFrom(new Error(`stats service responded with HTTP ${result.status}`), null, result.status, startedAt, request.path)
+            notice = failure.notice
+            return outcome
         }
         lastPayload = JSON.parse(result.body)
-        lastPayloadKey = `${request.path}?${JSON.stringify(request.query)}`
-        if (request.path !== "/locations") lastRefreshedAt = Date.now()
+        lastPayloadKey = key
+        if (request.path !== "/locations") {
+            lastRefreshedAt = Date.now()
+            lastRefreshedKey = key
+        }
         notice = null
+        failure = null
+        outcome = { kind: "ok" }
+        noteRecovered()
+        return outcome
     } catch (error) {
-        if (seq !== fetchSeq) return
-        notice = describeError(error)
+        if (!isCurrent()) return outcome
+        const code = error instanceof HostRequestError ? error.code : null
+        outcome = { kind: "failed", code }
+        failure = failureFrom(error, code, undefined, startedAt, request.path)
+        notice = failure.notice
+        return outcome
     } finally {
-        if (seq === fetchSeq) {
-            if (manual) refs?.refresh.update({ loading: false })
+        if (job.manual) refs?.refresh.update({ loading: false })
+        if (outcome.kind !== "superseded") {
+            if (failure && outcome.kind === "failed") void recordFailure(failure)
             render()
-        } else if (manual) {
-            // a newer request took over; it clears the spinner only if it is manual too
-            refs?.refresh.update({ loading: false })
         }
     }
+}
+
+function failureFrom(error: unknown, code: string | null, httpStatus: number | undefined, startedAt: number, path: string): Failure {
+    return {
+        notice: describeError(error),
+        code,
+        ...(httpStatus === undefined ? {} : { httpStatus }),
+        at: Date.now(),
+        elapsedMs: Date.now() - startedAt,
+        path,
+        diagnosis: null,
+    }
+}
+
+// ------------------------------------------------------------ diagnostics
+
+const DIAGNOSTICS_MAX_EPISODES = 5
+const DIAGNOSTICS_MAX_FAILURES = 8
+let episode: ConnectionEpisode | null = null
+let diagnosticsWrite: Promise<void> = Promise.resolve()
+/** episodes from host storage for both surfaces, shown in Settings */
+let connectionHistory: ConnectionEpisode[] = []
+
+function diagnosticsKey(which: "panel" | "status" = surface): string {
+    return `diagnostics-${which}`
+}
+
+/** `host.serviceStatus` with its own short deadline, so diagnosis never holds up recovery. */
+async function serviceStatusNow(): Promise<string | null> {
+    let timer: number | undefined
+    try {
+        const answer = await Promise.race([
+            host.serviceStatus(),
+            new Promise<null>((resolve) => { timer = window.setTimeout(() => resolve(null), 3000) }),
+        ])
+        return answer && typeof answer.status === "string" ? answer.status : null
+    } catch {
+        return null
+    } finally {
+        if (timer !== undefined) window.clearTimeout(timer)
+    }
+}
+
+function readEpisodes(raw: unknown): ConnectionEpisode[] {
+    if (!raw || typeof raw !== "object" || !Array.isArray((raw as { episodes?: unknown }).episodes)) return []
+    return ((raw as { episodes: unknown[] }).episodes).filter(
+        (e): e is ConnectionEpisode => !!e && typeof e === "object" && typeof (e as ConnectionEpisode).startedAt === "number" && Array.isArray((e as ConnectionEpisode).failures),
+    )
+}
+
+/** Keep the current episode in host storage: the next launch can show what failed. */
+function persistEpisode(snapshot: ConnectionEpisode): void {
+    const key = diagnosticsKey(snapshot.surface)
+    diagnosticsWrite = diagnosticsWrite.then(async () => {
+        try {
+            const stored = readEpisodes(await host.storage.get(key)).filter((e) => e.startedAt !== snapshot.startedAt)
+            const episodes = [snapshot, ...stored].slice(0, DIAGNOSTICS_MAX_EPISODES)
+            await host.storage.set(key, { version: 1, episodes } as unknown as Parameters<typeof host.storage.set>[1])
+        } catch {
+            // diagnostics are best effort; never surface a storage problem as a stats failure
+        }
+    })
+}
+
+async function recordFailure(f: Failure): Promise<void> {
+    const serviceStatus = f.code === "HOST_UNAVAILABLE" ? null : await serviceStatusNow()
+    const diagnosis = diagnoseFailure({
+        code: f.code,
+        ...(f.httpStatus === undefined ? {} : { httpStatus: f.httpStatus }),
+        elapsedMs: f.elapsedMs,
+        serviceStatus,
+    })
+    if (failure === f) {
+        f.diagnosis = diagnosis
+        render()
+    }
+    episode ??= { surface, path: f.path, startedAt: f.at, failures: [], recoveredAt: null }
+    const record: FailureRecord = {
+        at: f.at,
+        code: f.code,
+        ...(f.httpStatus === undefined ? {} : { httpStatus: f.httpStatus }),
+        elapsedMs: f.elapsedMs,
+        serviceStatus,
+        kind: diagnosis.kind,
+        summary: diagnosis.summary,
+    }
+    episode.failures = [...episode.failures, record].slice(-DIAGNOSTICS_MAX_FAILURES)
+    persistEpisode({ ...episode })
+}
+
+function noteRecovered(): void {
+    if (!episode) return
+    const done = { ...episode, recoveredAt: Date.now() }
+    episode = null
+    persistEpisode(done)
+}
+
+async function loadConnectionHistory(): Promise<void> {
+    const all: ConnectionEpisode[] = []
+    for (const which of ["panel", "status"] as const) {
+        try {
+            all.push(...readEpisodes(await host.storage.get(diagnosticsKey(which))))
+        } catch {
+            // unreadable history just shows nothing
+        }
+    }
+    connectionHistory = all.sort((a, b) => b.startedAt - a.startedAt).slice(0, DIAGNOSTICS_MAX_EPISODES)
 }
 
 function describeError(error: unknown): Notice {
@@ -1384,38 +1597,47 @@ function describeError(error: unknown): Notice {
 }
 
 /**
- * One timer, re-armed after each refresh, at the interval from settings.
- * Off when auto-refresh is off. Hidden pages and the settings form skip a
- * tick (no re-render under the user's typing).
+ * The scheduler owns the one timer: the normal interval from settings, or a
+ * short recovery delay after a transient failure. Hidden pages arm nothing,
+ * the settings form skips ticks (no re-render under the user's typing).
  */
-function schedulePoll(): void {
-    if (pollTimer !== null) {
-        window.clearTimeout(pollTimer)
-        pollTimer = null
-    }
-    if (!settings.autoRefresh) return
-    pollTimer = window.setTimeout(() => {
-        pollTimer = null
-        void (async () => {
-            if (document.visibilityState === "visible" && view !== "settings") {
-                // the status line has no settings form; pick up changes made in the panel
-                if (surface === "status") await loadSettings()
-                await refresh(false)
-            }
-            schedulePoll()
-        })()
-    }, settings.refreshSeconds * 1000)
-}
-
 let visibilityHooked = false
 
 function startPolling(): void {
-    schedulePoll()
     if (visibilityHooked) return
     visibilityHooked = true
-    document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "visible" && settings.autoRefresh && view !== "settings") void refresh(false)
+    document.addEventListener("visibilitychange", () => scheduler.visibilityChanged())
+    window.addEventListener("pagehide", (event) => {
+        if (!event.persisted) scheduler.dispose()
     })
+}
+
+/** What the banner says: a failure gains the recovery state and the age of the stats shown. */
+function displayNotice(): Notice | null {
+    if (!notice) return null
+    if (!failure || notice !== failure.notice) return notice
+    const state = scheduler.state()
+    const key = requestKey(currentRequest())
+    const shown = key === lastPayloadKey && key === lastRefreshedKey && lastRefreshedAt !== null
+        ? `Showing stats from ${formatStamp(lastRefreshedAt)}. `
+        : ""
+    if (state.phase === "recovering") {
+        return {
+            tone: "warning",
+            title: "Reconnecting to the stats service",
+            body: `${shown}Retrying automatically (attempt ${state.attempt} of ${state.maxAttempts}).`,
+        }
+    }
+    if (state.phase === "failing") {
+        const next = settings.autoRefresh ? `Next try in ${refreshLabel(settings.refreshSeconds)}. ` : ""
+        const why = failure.diagnosis ? `${failure.diagnosis.summary} ` : ""
+        return { ...notice, body: `${shown}${why}${next}${notice.body ?? ""}`.trim() }
+    }
+    return notice
+}
+
+function formatStamp(at: number): string {
+    return new Date(at).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" })
 }
 
 // -------------------------------------------------------------------- render
@@ -1431,27 +1653,29 @@ function renderPanel(force: boolean): void {
     renderNotice()
     syncChrome()
     // This lives outside the body diff: unchanged stats still get a fresh clock.
-    refs.lastRefreshed.textContent = formatRefreshedAt(lastRefreshedAt)
-
     const { path, query } = currentRequest()
-    const requestKey = `${path}?${JSON.stringify(query)}`
-    const data = (requestKey === lastPayloadKey ? lastPayload : null) as { meta?: { available?: boolean; home?: string; lastEvent?: number | null; generatedAt?: number } } | null
+    const currentKey = requestKey({ path, query })
+    // Only the request that produced the stats on screen may date them; Settings keeps the stats' time.
+    refs.lastRefreshed.textContent = formatRefreshedAt(view === "settings" || currentKey === lastRefreshedKey ? lastRefreshedAt : null)
+    const data = (currentKey === lastPayloadKey ? lastPayload : null) as { meta?: { available?: boolean; home?: string; lastEvent?: number | null; generatedAt?: number } } | null
     const meta = data?.meta
     const cadence = settings.autoRefresh ? `updates every ${refreshLabel(settings.refreshSeconds)}` : "auto-refresh off"
     refs.subtitle.textContent =
         view === "settings" ? "settings" : meta?.lastEvent ? `last activity ${formatAgo(meta.lastEvent)} · ${cadence}` : cadence
 
-    const key = `${requestKey}|${JSON.stringify({ ...(data ?? {}), meta: { ...meta, generatedAt: 0, lastEvent: 0 } })}`
+    // without stats, the body shows either the loading message or nothing under the notice
+    const waiting = !data && (!notice || scheduler.state().phase === "recovering")
+    const key = `${currentKey}|${waiting ? "loading" : ""}|${JSON.stringify({ ...(data ?? {}), meta: { ...meta, generatedAt: 0, lastEvent: 0 } })}`
     if (!force && key === lastRenderedKey) return
     lastRenderedKey = key
 
     const body = refs.body
-    const scrollTop = requestKey === lastRequestKey ? body.scrollTop : 0
-    lastRequestKey = requestKey
+    const scrollTop = currentKey === lastRequestKey ? body.scrollTop : 0
+    lastRequestKey = currentKey
     const content = el("div", "sq-content")
 
     if (!data) {
-        if (!notice) content.appendChild(loadingFeedback(
+        if (waiting) content.appendChild(loadingFeedback(
             "Preparing your stats",
             "Waiting for the local service to find and read squeez’s history. A first load can take longer while the service starts and builds its cache. Nothing is uploaded.",
         ))
@@ -1478,26 +1702,30 @@ function renderNotice(): void {
     noticeHandle?.dispose()
     noticeHandle = null
     refs.notice.replaceChildren()
-    if (!notice) return
-    const showRetry = notice.tone === "error" || notice.tone === "warning"
+    const shown = displayNotice()
+    if (!shown) return
+    const showRetry = shown.tone === "error" || shown.tone === "warning"
     noticeHandle = mountBanner(refs.notice, {
-        tone: notice.tone,
-        title: notice.title,
-        ...(notice.body ? { body: notice.body } : {}),
+        tone: shown.tone,
+        title: shown.title,
+        ...(shown.body ? { body: shown.body } : {}),
         ...(showRetry ? { action: { label: "Retry", onClick: () => void refresh(true) } } : {}),
     })
 }
 
 function renderStatus(): void {
     if (!statusRefs) return
-    const { path, query } = currentRequest()
-    const data = (`${path}?${JSON.stringify(query)}` === lastPayloadKey ? lastPayload : null) as StatusPayload | null
+    const currentKey = requestKey(currentRequest())
+    const data = (currentKey === lastPayloadKey ? lastPayload : null) as StatusPayload | null
     statusRefs.sub.classList.remove("sq-status-error")
     statusRefs.badge.hidden = true
+    const phase = scheduler.state().phase
+    const transient = !!notice && !!failure && notice === failure.notice && (phase === "recovering" || phase === "failing")
+    const stale = transient && !!data && currentKey === lastRefreshedKey && lastRefreshedAt !== null
 
-    if (notice) {
+    if (notice && !stale) {
         statusRefs.main.textContent = "Squeez"
-        statusRefs.sub.textContent = notice.title
+        statusRefs.sub.textContent = transient && phase === "recovering" ? "Reconnecting to the stats service…" : notice.title
         statusRefs.sub.classList.add("sq-status-error")
     } else if (!data) {
         statusRefs.main.textContent = "Squeez"
@@ -1515,6 +1743,11 @@ function renderStatus(): void {
     } else {
         statusRefs.main.textContent = "No shell commands today"
         statusRefs.sub.textContent = `${plural(data.tools.calls, "tool output")} measured · squeez only shortens shell output`
+    }
+    if (stale && lastRefreshedAt !== null) {
+        // last-good numbers stay; the second line says they are not current
+        statusRefs.sub.textContent = `${phase === "recovering" ? "Reconnecting" : "Not responding"} · numbers from ${formatStamp(lastRefreshedAt)}`
+        statusRefs.sub.classList.add("sq-status-error")
     }
     syncStatusHeight()
 }
@@ -1604,7 +1837,8 @@ host.onReady((ctx: HostReadyContext) => {
     applyHostReady(ctx, document.documentElement)
     surface = ctx.surface === "status" ? "status" : "panel"
     if (mounted) {
-        if (initialized) void refresh(false)
+        // a fresh ready (re-enable, reconnect) may lift a permanent stop
+        if (initialized) void scheduler.trigger("startup")
         return
     }
     mounted = true
@@ -1623,14 +1857,11 @@ host.onReady((ctx: HostReadyContext) => {
             render()
         },
         startPolling,
-        refresh: () => refresh(false),
+        refresh: () => scheduler.trigger("startup"),
     })
 })
 
 host.onSessionLifecycle(() => {
     if (!initialized || view === "settings") return
-    void (async () => {
-        if (surface === "status") await loadSettings()
-        await refresh(false)
-    })()
+    void scheduler.trigger("lifecycle")
 })
