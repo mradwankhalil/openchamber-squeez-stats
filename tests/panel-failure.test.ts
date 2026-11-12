@@ -213,3 +213,12 @@ test("with no stats yet, a failure that is not being retried replaces the loadin
     const content = p.body.children[0] as Element
     expect(content.children.some((c) => (c as Element & { loading?: boolean }).loading)).toBe(false)
 })
+
+test("failure diagnosis runs beside the request: a slow serviceStatus never delays the outcome", async () => {
+    const p = panel()
+    let diagnosing = 0
+    p.context.recordFailure = () => { diagnosing++; return new Promise<void>(() => {}) } // never settles
+    p.throwCode("HOST_TIMEOUT")
+    expect(await p.fetch()).toEqual({ kind: "failed", code: "HOST_TIMEOUT" })
+    expect(diagnosing).toBe(1)
+})

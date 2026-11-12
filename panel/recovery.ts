@@ -10,13 +10,26 @@
  *    after RECOVERY_DELAYS_MS, then falls back to the user's normal interval;
  *  - a permanent failure (not approved, paused, bad request) is not retried
  *    until the user acts or the host re-sends ready;
- *  - hidden frames arm nothing; dispose cancels everything.
+ *  - automatic requests (timer, retry, visibility, chat lifecycle) run only
+ *    while the frame is visible, outside the settings form and not halted.
+ *    That is checked when a request is triggered, again when a queued request
+ *    is taken off the queue, and before any timer is armed. A chat event
+ *    missed while hidden is replayed once when the frame shows again;
+ *  - explicit requests (`startup`, `user`) always run;
+ *  - hidden frames and the settings form arm nothing; dispose cancels everything.
  *
  * The scheduler never restarts the service. A request after a crash lets the
  * host restart it, exactly like a click on Retry.
  */
 
-/** Waits between recovery attempts. Sum stays far below one minute. */
+/**
+ * Waits between recovery attempts: four retries, 30 s of backoff in total.
+ * This bounds the number of attempts, not wall-clock time: each attempt may
+ * itself take up to the host's 20 s request deadline, so a service that never
+ * answers keeps the fast phase going for up to 5 × 20 s + 30 s = 130 s before
+ * the normal interval takes over. Failure diagnosis runs beside the scheduler
+ * and does not delay retries.
+ */
 export const RECOVERY_DELAYS_MS = [2_000, 4_000, 8_000, 16_000] as const
 
 /**
@@ -92,7 +105,7 @@ export function isPermanentFailure(code: string | null, httpStatus?: number): bo
     return false
 }
 
-/** Sources that may lift a permanent stop: explicit intent or a fresh host ready. */
+/** Explicit sources: they always run and may lift a permanent stop (intent or a fresh host ready). */
 const RESUMING_SOURCES = new Set<RefreshSource>(["startup", "user"])
 const SOURCE_RANK: Record<RefreshSource, number> = { user: 5, startup: 4, retry: 3, visible: 2, lifecycle: 1, auto: 0 }
 const MAX_SUPERSEDED_IN_A_ROW = 3
@@ -110,6 +123,21 @@ export function createRefreshScheduler(options: SchedulerOptions): RefreshSchedu
     let running = false
     let drain: Promise<void> = Promise.resolve()
     let disposed = false
+    /** an automatic request was skipped while hidden or under the settings form; replay once on show */
+    let missed = false
+
+    const explicit = (source: RefreshSource) => RESUMING_SOURCES.has(source)
+
+    /** May this request run now? Explicit requests always may; automatic ones need a visible frame, no form, no halt. */
+    function eligible(source: RefreshSource): boolean {
+        if (explicit(source)) return true
+        return phase !== "halted" && options.canRunAutomatically()
+    }
+
+    /** Record an automatic request that could not run, unless the halt makes it pointless. */
+    function skip(): void {
+        if (phase !== "halted") missed = true
+    }
 
     const state = (): RecoveryState => ({ phase, attempt, maxAttempts: delays.length, nextAt: timerAt, lastFailure })
     const changed = () => options.onChange?.(state())
@@ -122,14 +150,16 @@ export function createRefreshScheduler(options: SchedulerOptions): RefreshSchedu
 
     function arm(ms: number, source: "retry" | "auto"): void {
         clearTimer()
-        if (disposed) return
+        // visibilityChanged (show) or the next explicit request re-arms
+        if (disposed || !options.canRunAutomatically()) return
         timerAt = options.now() + ms
         timer = options.setTimer(() => {
             timer = null
             timerAt = null
-            if (disposed || !options.isVisible()) return // visibilityChanged resumes
+            if (disposed) return
             if (!options.canRunAutomatically()) {
-                armNormal()
+                // hidden or under the form when it fired: show or the next explicit request resumes
+                skip()
                 return
             }
             void trigger(source)
@@ -180,6 +210,12 @@ export function createRefreshScheduler(options: SchedulerOptions): RefreshSchedu
             while (pending && !disposed) {
                 const request = pending
                 pending = null
+                // the frame may have been hidden, the form opened or the service halted while it waited
+                if (!eligible(request.source)) {
+                    skip()
+                    continue
+                }
+                missed = false
                 let outcome: RunOutcome
                 try {
                     outcome = await options.run(request)
@@ -206,7 +242,11 @@ export function createRefreshScheduler(options: SchedulerOptions): RefreshSchedu
 
     function trigger(source: RefreshSource, extra: { manual?: boolean; rescan?: boolean } = {}): Promise<void> {
         if (disposed) return Promise.resolve()
-        if (phase === "halted" && !RESUMING_SOURCES.has(source)) return running ? drain : Promise.resolve()
+        if (!eligible(source)) {
+            // not started and not queued: a running request keeps its own timer decision
+            skip()
+            return running ? drain : Promise.resolve()
+        }
         const request: RefreshRequest = { manual: !!extra.manual, rescan: !!extra.rescan, source }
         pending = pending
             ? {
@@ -238,12 +278,17 @@ export function createRefreshScheduler(options: SchedulerOptions): RefreshSchedu
                 changed()
                 return
             }
-            if (phase === "halted" || !options.canRunAutomatically()) return
-            if (options.autoRefresh() || phase === "recovering") void trigger("visible")
+            if (phase === "halted") {
+                missed = false
+                return
+            }
+            if (!options.canRunAutomatically()) return
+            if (options.autoRefresh() || phase === "recovering" || missed) void trigger("visible")
         },
         dispose() {
             disposed = true
             pending = null
+            missed = false
             clearTimer()
         },
         state,
