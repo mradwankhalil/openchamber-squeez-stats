@@ -137,6 +137,7 @@ function startService(squeezHome) {
             SQUEEZ_STATS_HOME: squeezHome,
         },
         stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
     })
     let stderr = ""
     child.stderr.on("data", (chunk) => {
