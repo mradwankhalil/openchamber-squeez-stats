@@ -3,7 +3,11 @@
 OpenChamber offers **Update** for a git-installed copy when `version` in
 `package.json` goes up. Each entry below is one such version.
 
-## 0.4.1 — 2026-11-17
+## 0.5.0 — 2026-11-17
+
+Thanks to **[@milesbuckton](https://github.com/milesbuckton)**, who reported
+the missing OpenCode folder in [#1](https://github.com/mradwankhalil/openchamber-squeez-stats/issues/1) and fixed it in
+[#2](https://github.com/mradwankhalil/openchamber-squeez-stats/pull/2).
 
 ### Fixed
 
@@ -13,10 +17,15 @@ OpenChamber offers **Update** for a git-installed copy when `version` in
   looked there, so on a machine where squeez runs only through OpenCode the
   panel fell back to `~/.claude/squeez` and showed no event logs. Both folders
   are now checked. As before, the folder squeez wrote to most recently wins,
-  and Claude Code's folder stays the fallback when none has logs. Reported and
-  fixed by @milesbuckton (#1, #2).
+  and Claude Code's folder stays the fallback when none has logs.
 - A startup test no longer depends on the exact date format of the installed
   ICU data, which made it fail on newer Node builds.
+
+## 0.4.1 — 2026-11-17
+
+The fix above, first published as a patch release. 0.5.0 has the same code and
+adds the credit; releases that include a contributor's pull request get a new
+minor version.
 
 ## 0.4.0 — 2026-11-17
 

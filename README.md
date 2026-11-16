@@ -356,6 +356,10 @@ bun run release patch           # fixes: 0.3.0 → 0.3.1
 # or: bun run release minor     # features: 0.3.0 → 0.4.0
 ```
 
+A release that includes a contributor's pull request is always a **minor**
+release, even for a fix, and its changelog entry credits the contributor by
+GitHub handle with links to their issue and pull request.
+
 The script runs `bun run verify` (build, typecheck, unit tests and the service
 smoke test), bumps the version, commits `package.json` and the built bundles,
 and creates an annotated `vX.Y.Z` tag. It also accepts `major` or an explicit
