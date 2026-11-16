@@ -58,33 +58,39 @@ a full minute with the default settings.
   Only times, error codes and the service state are kept; see
   [Privacy and permissions](README.md#privacy-and-permissions).
 
-### Changed
-
-- **Problems that a retry cannot fix are not retried.** These are the local
-  service not being approved, the extension being paused, and a request the
-  service rejects. The panel waits for you to press **Retry**, or for
-  OpenChamber to reconnect the extension, instead of failing again every
-  interval.
-- **Only one request at a time.** Timer ticks, chat start/end, showing the
-  panel and clicks no longer send overlapping requests. A click or navigation
-  while a slow request is still running waits for it, then loads what you
-  asked for.
-- **A hidden panel sends nothing on its own.** Showing it again refreshes once.
-  This also covers a chat that started or ended while it was hidden, even
-  with **Refresh automatically** off. The settings form is never refreshed
-  under your typing.
-- **Last refreshed** now only shows the time of the stats actually on screen.
-  Switching to a view that has not loaded yet shows "not yet" instead of
-  another view's time.
-- An answer for a view, period, location or setting you have already moved
-  away from is discarded, never shown.
-
 ### Fixed
 
+- **A failed first refresh stayed on screen for a full minute.** When the
+  service was still starting, or briefly failed, the panel showed the error
+  and did not try again until the next scheduled refresh (60 seconds with the
+  default settings). It now retries within seconds, as described above.
+- **The Work Status line lost today's numbers on a failed refresh.** It
+  replaced them with the error title. It now keeps the numbers and adds
+  "Reconnecting · numbers from HH:MM:SS".
+- **Overlapping requests.** Timer ticks, chat start/end, showing the panel and
+  clicks could each send a request while another was still running. Now only
+  one request runs at a time. A click or navigation during a slow request
+  waits for it, then loads what you asked for.
+- **Problems a retry cannot fix were retried every interval.** These are the
+  local service not being approved, the extension being paused, and a request
+  the service rejects. The panel now waits for you to press **Retry**, or for
+  OpenChamber to reconnect the extension.
+- **Last refreshed could show another view's time.** Switching to a view that
+  had not loaded yet showed the time of a different view. It now shows the
+  time of the stats actually on screen, or "not yet".
 - With no stats loaded yet, an error no longer leaves "Preparing your stats"
   on screen underneath it.
 - The smoke test starts its service without opening a console window on
   Windows.
+
+### Changed
+
+- **A hidden panel sends nothing on its own.** Showing it again refreshes once.
+  This also covers a chat that started or ended while it was hidden, even
+  with **Refresh automatically** off. The settings form is never refreshed
+  under your typing.
+- An answer for a view, period, location or setting you have already moved
+  away from is discarded, never shown.
 
 ### Not changed
 
