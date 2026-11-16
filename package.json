@@ -1,6 +1,6 @@
 {
     "name": "openchamber-squeez-stats",
-    "version": "0.4.1",
+    "version": "0.5.0",
     "private": true,
     "type": "module",
     "description": "OpenChamber extension: everything squeez records, counted from its own files",
