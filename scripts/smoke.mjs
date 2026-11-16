@@ -122,7 +122,8 @@ await fs.writeFile(path.join(home, "config.ini"), "# squeez\nenabled = true\nmem
 const port = await freePort()
 const token = "smoke-token"
 
-// an empty user profile, so discovery never finds this machine's real squeez
+// an empty user profile and no XDG_STATE_HOME, so discovery never finds this
+// machine's real squeez
 const fakeUser = await fs.mkdtemp(path.join(os.tmpdir(), "sq-stats-user-"))
 
 function startService(squeezHome) {
@@ -132,6 +133,7 @@ function startService(squeezHome) {
             HOME: fakeUser,
             USERPROFILE: fakeUser,
             SQUEEZ_DIR: "",
+            XDG_STATE_HOME: "",
             OPENCHAMBER_SERVICE_PORT: String(port),
             OPENCHAMBER_SERVICE_TOKEN: token,
             SQUEEZ_STATS_HOME: squeezHome,

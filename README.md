@@ -87,10 +87,12 @@ state, one per host it supports:
 | `~/.hermes/squeez` | Hermes |
 | `~/.pi/squeez` | pi |
 | `~/.config/opencode/squeez` | OpenCode |
+| `~/.local/state/squeez/opencode` | OpenCode, through the squeez OpenCode plugin |
 
 `~` is your user folder (`C:\Users\<you>` on Windows). If the service's
-environment sets `SQUEEZ_STATS_HOME` or `SQUEEZ_DIR`, that folder is tried
-first. Among the folders that exist, the one squeez wrote to **most recently**
+environment sets `XDG_STATE_HOME`, `$XDG_STATE_HOME/squeez/opencode` is checked
+as well, since that is where the OpenCode plugin then keeps its state. If it
+sets `SQUEEZ_STATS_HOME` or `SQUEEZ_DIR`, that folder is tried first. Among the folders that exist, the one squeez wrote to **most recently**
 is used.
 
 If nothing is found, or the wrong store is picked, the panel says so and offers

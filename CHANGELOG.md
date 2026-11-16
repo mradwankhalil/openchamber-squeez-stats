@@ -3,6 +3,21 @@
 OpenChamber offers **Update** for a git-installed copy when `version` in
 `package.json` goes up. Each entry below is one such version.
 
+## 0.4.1 — 2026-11-17
+
+### Fixed
+
+- **OpenCode-only setups now find their squeez data.** The squeez OpenCode
+  plugin keeps its state in `~/.local/state/squeez/opencode`, or in
+  `$XDG_STATE_HOME/squeez/opencode` when that variable is set. Discovery never
+  looked there, so on a machine where squeez runs only through OpenCode the
+  panel fell back to `~/.claude/squeez` and showed no event logs. Both folders
+  are now checked. As before, the folder squeez wrote to most recently wins,
+  and Claude Code's folder stays the fallback when none has logs. Reported and
+  fixed by @milesbuckton (#1, #2).
+- A startup test no longer depends on the exact date format of the installed
+  ICU data, which made it fail on newer Node builds.
+
 ## 0.4.0 — 2026-11-17
 
 The panel and the Work Status line now recover by themselves when the local

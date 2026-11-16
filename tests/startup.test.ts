@@ -23,6 +23,9 @@ test("does not label an unfinished or failed refresh as successful", () => {
 })
 
 test("refresh label includes a full local date and time, including seconds", () => {
-    expect(formatRefreshedAt(new Date(2026, 9, 28, 12, 34, 56).getTime(), "en-GB"))
-        .toBe("Last refreshed: 28 Oct 2026, 12:34:56")
+    // ICU versions differ on the joiner ("28 Oct 2026, 12:34:56" vs "28 Oct 2026 at 12:34:56"),
+    // so check the parts rather than one exact string
+    const label = formatRefreshedAt(new Date(2026, 9, 28, 12, 34, 56).getTime(), "en-GB")
+    expect(label.startsWith("Last refreshed: 28 Oct 2026")).toBe(true)
+    expect(label.endsWith("12:34:56")).toBe(true)
 })
