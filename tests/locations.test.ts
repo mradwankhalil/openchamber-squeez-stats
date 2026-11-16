@@ -33,6 +33,7 @@ describe("discovery", () => {
             ".hermes",
             ".pi",
             ".config",
+            ".local",
         ])
         expect(found[0]?.hasSessions).toBe(true)
         expect(found[2]?.hasSessions).toBe(false)
@@ -46,6 +47,20 @@ describe("discovery", () => {
         await store(custom, [])
         const found = await discoverHomes({ SQUEEZ_DIR: custom }, user)
         expect(found[0]).toMatchObject({ path: custom, source: "env", hasSessions: true, logFiles: 0 })
+        expect(pickHome(found, user)).toBe(custom)
+    })
+
+    test("finds the OpenCode plugin's XDG state folder", async () => {
+        const user = path.join(tmp, "user4")
+        const fallback = path.join(user, ".local", "state", "squeez", "opencode")
+        await store(fallback, ["2026-01-01-10.jsonl"], 1_000_000)
+        expect(pickHome(await discoverHomes({}, user), user)).toBe(fallback)
+
+        const xdg = path.join(tmp, "xdg-state")
+        const custom = path.join(xdg, "squeez", "opencode")
+        await store(custom, ["2026-01-02-10.jsonl"], 2_000_000)
+        const found = await discoverHomes({ XDG_STATE_HOME: xdg }, user)
+        expect(found.at(-1)).toMatchObject({ path: custom, source: "default", hasSessions: true })
         expect(pickHome(found, user)).toBe(custom)
     })
 

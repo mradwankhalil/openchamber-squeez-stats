@@ -693,7 +693,8 @@ var HOME_CANDIDATES = [
   [".gemini", "squeez"],
   [".hermes", "squeez"],
   [".pi", "squeez"],
-  [".config", "opencode", "squeez"]
+  [".config", "opencode", "squeez"],
+  [".local", "state", "squeez", "opencode"]
 ];
 var LOG_NAME = /^\d{4}-\d{2}-\d{2}-\d{2}\.jsonl$/;
 async function inspectHome(dir, source) {
@@ -734,6 +735,9 @@ async function discoverHomes(env = process.env, userHome = os.homedir()) {
   if (userHome)
     for (const parts of HOME_CANDIDATES)
       await add(path.join(userHome, ...parts), "default");
+  const xdgState = env.XDG_STATE_HOME?.trim();
+  if (xdgState)
+    await add(path.join(xdgState, "squeez", "opencode"), "default");
   return out;
 }
 function pickHome(candidates, userHome = os.homedir()) {
