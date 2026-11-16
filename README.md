@@ -21,6 +21,7 @@ section in the panel says in one sentence what it counts.
 - [Requirements](#requirements)
 - [Install](#install)
 - [First run: finding squeez's files](#first-run-finding-squeezs-files)
+- [When the service is slow or unavailable](#when-the-service-is-slow-or-unavailable)
 - [Settings](#settings)
 - [The views](#the-views)
 - [What squeez does, and what it records](#what-squeez-does-and-what-it-records)
@@ -30,6 +31,7 @@ section in the panel says in one sentence what it counts.
 - [Troubleshooting](#troubleshooting)
 - [Develop](#develop)
 - [Releases and update checks](#releases-and-update-checks)
+- [Changelog](CHANGELOG.md)
 - [License](#license)
 
 ## Requirements
@@ -65,8 +67,11 @@ OpenChamber, loading saved settings, then preparing stats from local squeez
 history. Starting the service and building its in-memory cache can take longer
 than later refreshes. There is no guessed progress percentage. Below **Refresh**
 and **Settings**, **Last refreshed** shows the local date and time of the last
-successful stats response, including silent automatic refreshes. Failed
-requests leave that timestamp unchanged.
+successful stats response for what is on screen, including silent automatic
+refreshes. Failed requests leave that timestamp unchanged, and a view that has
+not loaded yet shows "not yet" rather than another view's time. If the service
+is slow to start, the panel retries by itself; see
+[When the service is slow or unavailable](#when-the-service-is-slow-or-unavailable).
 
 ## First run: finding squeez's files
 
@@ -106,6 +111,56 @@ Only the event logs folder is required. The other files add detail (session
 records, stashed outputs, squeez's settings) and their sections simply hide when
 they are missing.
 
+## When the service is slow or unavailable
+
+The numbers come from a small local service that OpenChamber starts on demand.
+Its first start reads squeez's whole history, and on a busy machine OpenChamber
+can give up waiting before it answers. The panel handles that on its own.
+
+**Temporary problems are retried quickly.** "Still starting", "crashed", "no
+answer in time" and a server error from the service all count as temporary.
+The panel tries again after 2, 4, 8 and 16 seconds, four retries in all, and
+then returns to your **Refresh every** interval. The waits add up to 30
+seconds, but that is not a time limit. Each attempt can take up to
+OpenChamber's own 20-second request limit, so a service that never answers can
+keep the fast retries going for up to about two minutes (5 × 20 s + 30 s).
+While it retries, the banner reads **Reconnecting to the stats service** and
+counts the attempts. If all four fail, it reads **Stats service is not
+responding**, says what went wrong, and says when the next normal try is.
+
+**What you already had stays on screen.** The numbers from the last successful
+refresh stay visible, and the banner says when they were fetched, for example
+"Showing stats from 14:02:31". The Work Status line keeps today's numbers and
+its second line changes to "Reconnecting · numbers from 14:02:31". Nothing is
+replaced by a blank error page.
+
+**Problems a retry cannot fix are not retried.** These are a local service that
+is not approved, an extension paused in Settings → Extensions, and a request the
+service rejects. The panel shows what to do and waits for you to press
+**Retry**, or for OpenChamber to reconnect the extension.
+
+**It stays quiet when you are not looking.** The panel sends one request at a
+time, so clicks, timer ticks and chat events never pile up. A hidden panel
+sends nothing on its own; when it shows again it refreshes once. That includes
+a chat that started or ended while it was hidden, even with **Refresh
+automatically** off. While **Settings** is open, nothing refreshes under your
+typing. A click or a switch of view while a slow request is still running waits
+for that request, then loads what you asked for. An answer for a view, period,
+location or setting you have already left is thrown away.
+
+The panel never restarts the service itself. If the service crashed, the next
+retry lets OpenChamber start it again, exactly as pressing **Retry** does.
+
+**Connection history.** Every failed attempt is recorded, and Settings →
+**Connection to the stats service** lists the last three problems. Each entry
+gives when the problem began, on the panel or the Work Status line, what kind
+of failure it was, how many attempts failed, and whether it recovered and how
+long that took. The kinds tell apart a service that never became ready, a
+service that was running but did not answer this request, OpenChamber itself
+not answering, an error from the service, and not approved or paused. This is
+the first place to look after a slow or failed start; see
+[Privacy and permissions](#privacy-and-permissions) for what is kept.
+
 ## Settings
 
 Open them with **Settings** in the panel header. They are saved in the
@@ -114,7 +169,7 @@ line share them, and they survive restarts and updates.
 
 | Setting | Default | What it does |
 |---|---|---|
-| Refresh automatically | on | Updates the numbers by themselves. Off: only the **Refresh** button and chat start/end update them. |
+| Refresh automatically | on | Updates the numbers by themselves. Off: only the **Refresh** button and chat start/end update them. A load you started yourself is still retried a few times if the service is slow; see [When the service is slow or unavailable](#when-the-service-is-slow-or-unavailable). |
 | Refresh every | 1 minute | 15 s, 30 s, 1, 2, 5, 10 or 30 minutes. Background refreshes are silent: no spinner, and the page only repaints when the numbers changed, so the scroll position stays put. |
 | Default period | 30 days | The period Overview and Sessions open with (Today, 7 days, 30 days, All). |
 | Show empty sessions | off | Lists sessions that started and ended without running anything. |
@@ -135,6 +190,11 @@ List lengths, with their defaults:
 | Test results | 8 | | |
 
 **Reset all settings** returns to every default above.
+
+Below the settings, **Connection to the stats service** lists recent
+connection problems (see
+[When the service is slow or unavailable](#when-the-service-is-slow-or-unavailable)).
+It is read-only and is not reset with the settings.
 
 ## The views
 
@@ -221,6 +281,13 @@ Inside its folder squeez keeps:
   Settings. Entered paths must be absolute.
 - Settings are stored in OpenChamber's extension storage and deleted when the
   extension is uninstalled.
+- The connection history is kept in the same storage, under
+  `diagnostics-panel` and `diagnostics-status`: at most five problems per
+  surface, eight failed attempts each. An attempt records its time, the error
+  code or HTTP status, how long it took, the state OpenChamber reported for the
+  service, and a one-line summary. File paths, request parameters and anything
+  the service printed are never stored. It is written only when a request fails
+  and when it recovers, and it is deleted with the extension.
 
 ## Troubleshooting
 
@@ -229,7 +296,8 @@ Inside its folder squeez keeps:
 | "Local service not approved" | Settings → Extensions → Squeez Stats → allow **Run a local service**, then Retry. |
 | "squeez's event logs were not found" | Is squeez installed and has an agent run a command through it? Then press **Choose squeez's files…** and pick or enter the folder. |
 | Numbers look like another machine's or another host's | Settings → squeez's files → the list of places shows every store; pick the right one with **Use this**. |
-| "Stats service is not responding" | Retry. If it persists, restart OpenChamber. |
+| "Reconnecting to the stats service" | Nothing: the panel is retrying by itself, and the stats on screen are from the time it shows. |
+| "Stats service is not responding" | The quick retries are used up; the banner says what failed and when the next try is. Press **Retry**. If it keeps happening, restart OpenChamber, and check Settings → **Connection to the stats service** for what went wrong. |
 | Numbers do not change | Check **Refresh automatically** in Settings, or press **Refresh**. |
 | A list is too short or too long | Settings → List lengths. |
 
@@ -242,7 +310,7 @@ are built and committed. Rebuild and commit them with every change.
 bun install
 bun run build      # bundles panel/main.js and service/main.js
 bun run typecheck
-bun test           # unit tests: parsing, aggregation, discovery, settings limits
+bun test           # unit tests: parsing, aggregation, discovery, settings limits, refresh recovery
 node scripts/smoke.mjs   # runs the built service against a throwaway squeez folder
 ```
 
@@ -254,6 +322,8 @@ service/store.ts    readers for every squeez file, discovery, change-aware cache
 service/report.ts   pure aggregations, list limits, and the payload types the panel imports
 service/main.ts     HTTP routes: /status /overview /sessions /session /now /storage /locations
 panel/main.ts       the four views, Settings, and the Work Status line
+panel/recovery.ts   refresh scheduling: one request at a time, bounded retries, failure diagnosis
+panel/startup.ts    startup ordering and the "Last refreshed" label
 panel/panel.css     styles (host theme tokens; nothing smaller than 0.9rem)
 tests/              bun unit tests
 scripts/smoke.mjs   end-to-end check of the built service
@@ -274,8 +344,9 @@ offers; install from the repository URL to follow published updates.
 
 ### Cut a release locally
 
-Commit your source changes first, including rebuilt bundles. With a clean
-working tree, normally on `main`, run:
+Commit your source changes first, including rebuilt bundles, and add an entry
+for the new version to [CHANGELOG.md](CHANGELOG.md). With a clean working tree,
+normally on `main`, run:
 
 ```sh
 bun run release patch --dry-run  # verify without creating a release
