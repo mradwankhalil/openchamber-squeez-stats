@@ -1629,7 +1629,8 @@ function displayNotice(): Notice | null {
         }
     }
     if (state.phase === "failing") {
-        const next = settings.autoRefresh ? `Next try in ${refreshLabel(settings.refreshSeconds)}. ` : ""
+        // the wait actually armed: 15 s steady retries, or the saved interval once they end
+        const next = state.nextDelayMs !== null ? `Next try in ${refreshLabel(Math.max(1, Math.round(state.nextDelayMs / 1000)))}. ` : ""
         const why = failure.diagnosis ? `${failure.diagnosis.summary} ` : ""
         return { ...notice, body: `${shown}${why}${next}${notice.body ?? ""}`.trim() }
     }

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { RECOVERY_DELAYS_MS, createRefreshScheduler, diagnoseFailure, isPermanentFailure } from "../panel/recovery"
+import { RECOVERY_DELAYS_MS, STEADY_RETRY_MS, STEADY_RETRY_WINDOW_MS, createRefreshScheduler, diagnoseFailure, isPermanentFailure } from "../panel/recovery"
 import type { RefreshRequest, RunOutcome } from "../panel/recovery"
 
 /** Deterministic clock: timers only fire when the test advances time. */
@@ -88,7 +88,7 @@ test("first request fails, then recovers well before the 60 s interval", async (
     expect(h.scheduler.state().phase).toBe("healthy")
 })
 
-test("retries back off and are bounded; persistent failure falls back to the saved cadence", async () => {
+test("retries back off, then keep trying every 15 s instead of waiting the saved interval", async () => {
     const h = harness()
     for (let i = 0; i < 20; i++) h.outcomes.push(transient())
     await h.scheduler.trigger("startup")
@@ -101,13 +101,13 @@ test("retries back off and are bounded; persistent failure falls back to the sav
     for (let i = 1; i < gaps.length; i++) expect(gaps[i]!).toBeGreaterThan(gaps[i - 1]!)
     expect(h.runs).toHaveLength(1 + RECOVERY_DELAYS_MS.length)
     expect(h.scheduler.state().phase).toBe("failing")
-    // no more fast retries: the next one waits the user's normal interval
-    expect(h.pendingDelays()).toEqual([60_000])
-    await h.advance(59_999)
+    // no more fast retries: steady retries every 15 s, not the 60 s interval
+    expect(h.pendingDelays()).toEqual([STEADY_RETRY_MS])
+    await h.advance(STEADY_RETRY_MS - 1)
     expect(h.runs).toHaveLength(1 + RECOVERY_DELAYS_MS.length)
     await h.advance(1)
     expect(h.runs).toHaveLength(2 + RECOVERY_DELAYS_MS.length)
-    expect(h.pendingDelays()).toEqual([60_000])
+    expect(h.pendingDelays()).toEqual([STEADY_RETRY_MS])
 })
 
 test("recovery is bounded by attempts: four retries, 30 s of backoff in total", () => {
@@ -125,11 +125,11 @@ test("backoff is not a wall-clock budget: slow failures stretch recovery past 30
     expect(h.runs).toHaveLength(1 + RECOVERY_DELAYS_MS.length)
     expect(h.scheduler.state().phase).toBe("recovering")
     await h.advance(1)
-    // 5 attempts of 20 s each plus 30 s of backoff: 130 s before the normal cadence takes over
+    // 5 attempts of 20 s each plus 30 s of backoff: 130 s before steady retries take over
     expect(h.now).toBe(130_000)
     expect(h.scheduler.state().phase).toBe("failing")
     expect(h.runs.map((r) => r.at)).toEqual([0, 22_000, 46_000, 74_000, 110_000])
-    expect(h.pendingDelays()).toEqual([60_000])
+    expect(h.pendingDelays()).toEqual([STEADY_RETRY_MS])
     expect(h.maxInFlight).toBe(1)
 })
 
@@ -536,4 +536,140 @@ test("an automatic trigger that cannot run never cancels a pending recovery retr
     h.env.settingsView = false
     await h.advance(RECOVERY_DELAYS_MS[0])
     expect(h.runs.map((r) => r.source)).toEqual(["startup", "retry"])
+})
+
+// ------------------------------------------------- 0.5.1: steady retries while the error shows
+
+/** fail the first request and all four quick retries */
+async function exhaustQuickRetries(h: ReturnType<typeof harness>, source: "startup" | "user" = "startup") {
+    await h.scheduler.trigger(source)
+    for (let i = 0; i < RECOVERY_DELAYS_MS.length; i++) await h.advance(h.pendingDelays()[0]!)
+    expect(h.runs).toHaveLength(1 + RECOVERY_DELAYS_MS.length)
+}
+
+test("steady retries are 15 s for at most 10 minutes", () => {
+    expect(STEADY_RETRY_MS).toBe(15_000)
+    expect(STEADY_RETRY_WINDOW_MS).toBe(10 * 60_000)
+})
+
+test("a host stall longer than the quick retries: stats come back within 15 s of it ending", async () => {
+    const h = harness()
+    for (let i = 0; i < 1 + RECOVERY_DELAYS_MS.length + 3; i++) h.outcomes.push(transient())
+    await exhaustQuickRetries(h)
+    const failedAt = h.now
+    for (let i = 0; i < 4; i++) await h.advance(STEADY_RETRY_MS)
+    const last = h.runs.at(-1)!
+    expect(last.at - failedAt).toBe(4 * STEADY_RETRY_MS)
+    expect(h.runs.slice(-4).map((r) => r.source)).toEqual(["retry", "retry", "retry", "retry"])
+    expect(h.scheduler.state().phase).toBe("healthy")
+    // healthy again: back to the saved interval
+    expect(h.pendingDelays()).toEqual([60_000])
+    expect(h.maxInFlight).toBe(1)
+})
+
+test("steady retries stop 10 minutes after the first failure; then the saved interval", async () => {
+    const h = harness()
+    for (let i = 0; i < 200; i++) h.outcomes.push(transient())
+    await exhaustQuickRetries(h)
+    await h.advance(STEADY_RETRY_WINDOW_MS - h.now)
+    const times = h.runs.map((r) => r.at)
+    const steady = times.slice(1 + RECOVERY_DELAYS_MS.length)
+    for (let i = 1; i < steady.length; i++) expect(steady[i]! - steady[i - 1]!).toBe(STEADY_RETRY_MS)
+    expect(Math.max(...times)).toBeLessThanOrEqual(STEADY_RETRY_WINDOW_MS)
+    expect(Math.max(...times)).toBeGreaterThan(STEADY_RETRY_WINDOW_MS - STEADY_RETRY_MS)
+    expect(h.pendingDelays()).toEqual([60_000])
+    const count = h.runs.length
+    await h.advance(60_000)
+    expect(h.runs).toHaveLength(count + 1)
+    expect(h.pendingDelays()).toEqual([60_000])
+})
+
+test("a refresh interval shorter than 15 s is kept for steady retries", async () => {
+    const h = harness({ intervalMs: 5_000 })
+    for (let i = 0; i < 20; i++) h.outcomes.push(transient())
+    await exhaustQuickRetries(h)
+    expect(h.pendingDelays()).toEqual([5_000])
+})
+
+test("auto-refresh off: an explicit load gets the quick retries but no steady retries", async () => {
+    const h = harness({ autoRefresh: false })
+    for (let i = 0; i < 20; i++) h.outcomes.push(transient())
+    await exhaustQuickRetries(h, "user")
+    expect(h.scheduler.state().phase).toBe("failing")
+    expect(h.timers.size).toBe(0)
+    await h.advance(STEADY_RETRY_WINDOW_MS)
+    expect(h.runs).toHaveLength(1 + RECOVERY_DELAYS_MS.length)
+})
+
+test("hidden during steady retries: nothing is armed; showing again retries at once", async () => {
+    const h = harness()
+    for (let i = 0; i < 20; i++) h.outcomes.push(transient())
+    await exhaustQuickRetries(h)
+    h.env.visible = false
+    h.scheduler.visibilityChanged()
+    expect(h.timers.size).toBe(0)
+    await h.advance(120_000)
+    expect(h.runs).toHaveLength(1 + RECOVERY_DELAYS_MS.length)
+    h.env.visible = true
+    h.scheduler.visibilityChanged()
+    await h.flush()
+    expect(h.runs).toHaveLength(2 + RECOVERY_DELAYS_MS.length)
+    expect(h.runs.at(-1)!.source).toBe("visible")
+    expect(h.pendingDelays()).toEqual([STEADY_RETRY_MS])
+})
+
+test("settings form during steady retries: nothing runs under the form", async () => {
+    const h = harness()
+    for (let i = 0; i < 20; i++) h.outcomes.push(transient())
+    await exhaustQuickRetries(h)
+    h.env.settingsView = true
+    await h.advance(STEADY_RETRY_MS)
+    expect(h.runs).toHaveLength(1 + RECOVERY_DELAYS_MS.length)
+    expect(h.timers.size).toBe(0)
+})
+
+test("a permanent failure during steady retries halts them", async () => {
+    const h = harness()
+    for (let i = 0; i < 1 + RECOVERY_DELAYS_MS.length; i++) h.outcomes.push(transient())
+    h.outcomes.push({ kind: "failed", code: "NO_SERVICE" })
+    await exhaustQuickRetries(h)
+    await h.advance(STEADY_RETRY_MS)
+    expect(h.scheduler.state().phase).toBe("halted")
+    expect(h.timers.size).toBe(0)
+})
+
+test("reschedule during steady retries keeps the 15 s retry", async () => {
+    const h = harness()
+    for (let i = 0; i < 20; i++) h.outcomes.push(transient())
+    await exhaustQuickRetries(h)
+    await h.advance(5_000)
+    h.scheduler.reschedule()
+    expect(h.pendingDelays()).toEqual([STEADY_RETRY_MS])
+})
+
+test("a click after the steady window starts a fresh episode: quick retries, then steady retries", async () => {
+    const h = harness()
+    for (let i = 0; i < 200; i++) h.outcomes.push(transient())
+    await exhaustQuickRetries(h)
+    await h.advance(STEADY_RETRY_WINDOW_MS - h.now)
+    expect(h.pendingDelays()).toEqual([60_000])
+    await h.scheduler.trigger("user", { manual: true })
+    expect(h.scheduler.state().phase).toBe("recovering")
+    expect(h.pendingDelays()).toEqual([RECOVERY_DELAYS_MS[0]])
+    for (let i = 0; i < RECOVERY_DELAYS_MS.length; i++) await h.advance(h.pendingDelays()[0]!)
+    expect(h.pendingDelays()).toEqual([STEADY_RETRY_MS])
+})
+
+test("state reports the armed wait so the banner names the real next try", async () => {
+    const h = harness()
+    for (let i = 0; i < 20; i++) h.outcomes.push(transient())
+    await exhaustQuickRetries(h)
+    expect(h.scheduler.state().nextDelayMs).toBe(STEADY_RETRY_MS)
+    h.outcomes.length = 0
+    await h.advance(STEADY_RETRY_MS)
+    expect(h.scheduler.state().phase).toBe("healthy")
+    expect(h.scheduler.state().nextDelayMs).toBe(60_000)
+    h.env.visible = false
+    h.scheduler.visibilityChanged()
+    expect(h.scheduler.state().nextDelayMs).toBeNull()
 })

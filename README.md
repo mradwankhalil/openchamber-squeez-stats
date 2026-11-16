@@ -116,19 +116,30 @@ they are missing.
 ## When the service is slow or unavailable
 
 The numbers come from a small local service that OpenChamber starts on demand.
-Its first start reads squeez's whole history, and on a busy machine OpenChamber
-can give up waiting before it answers. The panel handles that on its own.
+Started the way OpenChamber starts it, the service is ready in well under a
+second and answers its first request in about a second, even with a large
+squeez history. Longer waits happen inside OpenChamber itself, typically while
+it is starting or restarting its backend: every extension's requests stall at
+the same time, and other extensions' Work Status sections show errors too. The
+panel cannot speed that up, but it notices when OpenChamber is answering again.
 
 **Temporary problems are retried quickly.** "Still starting", "crashed", "no
 answer in time" and a server error from the service all count as temporary.
-The panel tries again after 2, 4, 8 and 16 seconds, four retries in all, and
-then returns to your **Refresh every** interval. The waits add up to 30
-seconds, but that is not a time limit. Each attempt can take up to
-OpenChamber's own 20-second request limit, so a service that never answers can
-keep the fast retries going for up to about two minutes (5 × 20 s + 30 s).
-While it retries, the banner reads **Reconnecting to the stats service** and
-counts the attempts. If all four fail, it reads **Stats service is not
-responding**, says what went wrong, and says when the next normal try is.
+The panel tries again after 2, 4, 8 and 16 seconds, four quick retries in all.
+The waits add up to 30 seconds, but that is not a time limit. Each attempt can
+take up to OpenChamber's own 20-second request limit, so a service that never
+answers can keep the quick retries going for up to about two minutes
+(5 × 20 s + 30 s). While they run, the banner reads **Reconnecting to the stats
+service** and counts the attempts.
+
+If all four fail, the banner reads **Stats service is not responding** and says
+what went wrong. The panel then keeps trying every 15 seconds (or at your
+**Refresh every** interval, if that is shorter) until 10 minutes have passed
+since the first failure, so the stats come back within seconds of OpenChamber
+recovering. After that it returns to your **Refresh every** interval. The
+banner always says when the next try is. These steady retries need
+**Auto-refresh** on; with it off, only the four quick retries of a load you
+started run, and **Retry** is always there.
 
 **What you already had stays on screen.** The numbers from the last successful
 refresh stay visible, and the banner says when they were fetched, for example

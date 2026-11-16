@@ -7,7 +7,9 @@
  *    into one follow-up request;
  *  - one timer; it is armed only when no request is in flight;
  *  - a transient failure (service starting, crashed, slow, HTTP 5xx) retries
- *    after RECOVERY_DELAYS_MS, then falls back to the user's normal interval;
+ *    after RECOVERY_DELAYS_MS, then every STEADY_RETRY_MS (auto-refresh on)
+ *    until STEADY_RETRY_WINDOW_MS after the first failure, then falls back to
+ *    the user's normal interval;
  *  - a permanent failure (not approved, paused, bad request) is not retried
  *    until the user acts or the host re-sends ready;
  *  - automatic requests (timer, retry, visibility, chat lifecycle) run only
@@ -31,6 +33,18 @@
  * and does not delay retries.
  */
 export const RECOVERY_DELAYS_MS = [2_000, 4_000, 8_000, 16_000] as const
+
+/**
+ * After the quick retries, a transient failure is retried every 15 s (or at
+ * the saved interval when that is shorter) until 10 minutes have passed since
+ * the episode's first failure; only then does the saved interval take over.
+ * An OpenChamber restart or a host-wide stall can outlast the quick retries;
+ * this brings the stats back within seconds of it ending instead of up to a
+ * full interval later. Only with auto-refresh on, only while visible and
+ * outside the settings form, never after a permanent failure.
+ */
+export const STEADY_RETRY_MS = 15_000
+export const STEADY_RETRY_WINDOW_MS = 10 * 60_000
 
 /**
  * Why a request is being made.
@@ -60,6 +74,8 @@ export interface RecoveryState {
     maxAttempts: number
     /** when the armed timer fires (scheduler clock), or null */
     nextAt: number | null
+    /** the wait the armed timer was set for, or null when none is armed */
+    nextDelayMs: number | null
     lastFailure: { code: string | null; httpStatus?: number } | null
 }
 
@@ -119,6 +135,9 @@ export function createRefreshScheduler(options: SchedulerOptions): RefreshSchedu
     let lastFailure: RecoveryState["lastFailure"] = null
     let timer: unknown = null
     let timerAt: number | null = null
+    let timerMs: number | null = null
+    /** scheduler clock at the current episode's first failure */
+    let episodeStartedAt = 0
     let pending: RefreshRequest | null = null
     let running = false
     let drain: Promise<void> = Promise.resolve()
@@ -139,13 +158,14 @@ export function createRefreshScheduler(options: SchedulerOptions): RefreshSchedu
         if (phase !== "halted") missed = true
     }
 
-    const state = (): RecoveryState => ({ phase, attempt, maxAttempts: delays.length, nextAt: timerAt, lastFailure })
+    const state = (): RecoveryState => ({ phase, attempt, maxAttempts: delays.length, nextAt: timerAt, nextDelayMs: timerMs, lastFailure })
     const changed = () => options.onChange?.(state())
 
     function clearTimer(): void {
         if (timer !== null) options.clearTimer(timer)
         timer = null
         timerAt = null
+        timerMs = null
     }
 
     function arm(ms: number, source: "retry" | "auto"): void {
@@ -153,9 +173,11 @@ export function createRefreshScheduler(options: SchedulerOptions): RefreshSchedu
         // visibilityChanged (show) or the next explicit request re-arms
         if (disposed || !options.canRunAutomatically()) return
         timerAt = options.now() + ms
+        timerMs = ms
         timer = options.setTimer(() => {
             timer = null
             timerAt = null
+            timerMs = null
             if (disposed) return
             if (!options.canRunAutomatically()) {
                 // hidden or under the form when it fired: show or the next explicit request resumes
@@ -169,6 +191,21 @@ export function createRefreshScheduler(options: SchedulerOptions): RefreshSchedu
     function armNormal(): void {
         if (options.autoRefresh()) arm(options.intervalMs(), "auto")
         else clearTimer()
+    }
+
+    /** The steady retry wait while the window lasts, else null (auto-refresh off or window over). */
+    function steadyDelay(): number | null {
+        if (!options.autoRefresh() || !episodeAllowed) return null
+        const ms = Math.min(STEADY_RETRY_MS, options.intervalMs())
+        if (options.now() + ms - episodeStartedAt > STEADY_RETRY_WINDOW_MS) return null
+        return ms
+    }
+
+    /** After the quick retries: keep trying every 15 s for a while, then the saved interval. */
+    function armAfterFailure(): void {
+        const ms = steadyDelay()
+        if (ms === null) armNormal()
+        else arm(ms, "retry")
     }
 
     function settle(request: RefreshRequest, outcome: Exclude<RunOutcome, { kind: "superseded" }>): void {
@@ -193,6 +230,7 @@ export function createRefreshScheduler(options: SchedulerOptions): RefreshSchedu
         if (attempt === 0 || (intent && phase !== "recovering")) {
             attempt = 0
             episodeAllowed = options.autoRefresh() || intent
+            episodeStartedAt = options.now()
         }
         attempt++
         if (episodeAllowed && attempt <= delays.length) {
@@ -200,7 +238,7 @@ export function createRefreshScheduler(options: SchedulerOptions): RefreshSchedu
             arm(delays[attempt - 1]!, "retry")
         } else {
             phase = "failing"
-            armNormal()
+            armAfterFailure()
         }
     }
 
@@ -269,7 +307,8 @@ export function createRefreshScheduler(options: SchedulerOptions): RefreshSchedu
         reschedule() {
             if (disposed || running || phase === "halted") return
             if (phase === "recovering" && timer !== null) return
-            armNormal()
+            if (phase === "failing") armAfterFailure()
+            else armNormal()
         },
         visibilityChanged() {
             if (disposed) return

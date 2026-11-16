@@ -3,6 +3,30 @@
 OpenChamber offers **Update** for a git-installed copy when `version` in
 `package.json` goes up. Each entry below is one such version.
 
+## 0.5.1 — 2026-11-17
+
+### Fixed
+
+- **Stats came back up to a minute late after OpenChamber recovered.** When
+  OpenChamber stalls for longer than the four quick retries (for example while
+  it starts or restarts its backend, when other extensions fail at the same
+  moment), the panel used to wait your full **Refresh every** interval before
+  trying again. It now keeps trying every 15 seconds, or at your interval if
+  that is shorter, for up to 10 minutes after the first failure, then returns
+  to your interval. It still needs **Auto-refresh** on, still pauses while the
+  panel is hidden or Settings is open, and still stops for problems only you
+  can fix (service not approved, extension paused).
+- The "not responding" banner now names the wait that is actually armed
+  ("Next try in 15 seconds") instead of always naming your refresh interval.
+
+### Not changed
+
+- The long wait itself. Measured on a real squeez history and started exactly
+  the way OpenChamber starts it, the service is ready in about a quarter of a
+  second and answers its first request in under a second. The delay happens
+  inside OpenChamber before a request reaches the service, so it affects every
+  extension at once and has to be fixed there.
+
 ## 0.5.0 — 2026-11-17
 
 Thanks to **[@milesbuckton](https://github.com/milesbuckton)**, who reported
